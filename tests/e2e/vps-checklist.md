@@ -1,0 +1,34 @@
+# mili — 2-VPS end-to-end checklist
+
+Two servers: **iran** (Ubuntu 24.04) and **foreign** (Debian 12). Run the whole
+list twice: (A) install mili first then 3x-ui, (B) 3x-ui first then mili.
+
+## Setup
+- [ ] `install.sh` on both; `mili version` matches.
+- [ ] `mili doctor` on both: GRE + FOU modules load, deps present.
+
+## Per priority tunnel (gre, grefrp, frp, backhaul, paqet, hedioum)
+- [ ] Create on foreign/iran as its wizard asks; copy the pairing code to the
+      other side (`mili import <code>`).
+- [ ] `mili status` shows it **up** on both sides.
+- [ ] SOCKS mode: on iran `curl --socks5-hostname 127.0.0.1:<port> https://api.ipify.org`
+      returns the **foreign** public IP.
+- [ ] Forward mode: a listener on foreign is reachable via the iran public port.
+- [ ] 3x-ui helper prints valid outbound JSON; paste into x-ui, route an inbound,
+      restart Xray, confirm egress IP = foreign.
+
+## Coexistence
+- [ ] All six tunnels **up simultaneously**; `mili ports` reports no conflict.
+- [ ] x-ui panel reachable, inbounds работают, ACME renew on port 80 still works.
+- [ ] x-ui menu *23 enable ufw* → tunnels survive (ufw mirrors present).
+- [ ] x-ui menu *26 BBR* → no sysctl fight (`sysctl net.ipv4.tcp_congestion_control`).
+- [ ] Add an x-ui inbound on a mili port → watchdog + menu header flag the clash.
+- [ ] `reboot` → every tunnel + firewall chain comes back (mili-fw + units).
+
+## Teardown
+- [ ] `mili uninstall` (everything) → zero leftovers:
+  - [ ] `iptables-save | grep -i mili` → empty
+  - [ ] `systemctl list-units 'mili*'` → none
+  - [ ] `ls /etc/sysctl.d | grep mili` → none
+  - [ ] `/etc/mili`, `/opt/mili`, `/usr/local/bin/mili` gone
+- [ ] x-ui still fully functional (never touched).

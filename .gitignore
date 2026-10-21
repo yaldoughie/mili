@@ -1,0 +1,16 @@
+# editor / OS cruft
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# local scratch / logs (never commit runtime state)
+*.log
+/tmp/
+scratch/
+
+# build artifacts that are NOT the published bundle
+# NOTE: dist/mili.sh IS committed (the installer fetches it from raw main).
+dist/*.tmp

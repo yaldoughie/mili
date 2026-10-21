@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-22.04, ubuntu-24.04 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck bats
+
+      - name: Syntax check all sources
+        run: |
+          for f in src/lib/*.sh src/tunnels/*.sh src/main.sh build.sh install.sh; do
+            echo "bash -n $f"; bash -n "$f"
+          done
+
+      - name: Build bundle
+        run: ./build.sh
+
+      - name: shellcheck (sources + bundle)
+        run: shellcheck -S warning -x src/lib/*.sh src/tunnels/*.sh src/main.sh dist/mili.sh || true
+
+      - name: Bundle syntax check
+        run: bash -n dist/mili.sh
+
+      - name: Unit tests (bats)
+        run: bats tests/unit/
+
+      - name: dist/mili.sh is up to date with src
+        run: |
+          ./build.sh >/dev/null
+          if ! git diff --quiet -- dist/mili.sh; then
+            echo "::error::dist/mili.sh is stale. Run ./build.sh and commit the result."
+            git --no-pager diff -- dist/mili.sh | head -40
+            exit 1
+          fi
