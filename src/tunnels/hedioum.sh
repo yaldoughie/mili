@@ -60,6 +60,9 @@ t_hedioum_wizard() {  # <role> <level>  (only the FOREIGN side runs this)
     ST[alias]="${ST[alias]:-$(hostname -s 2>/dev/null || echo iran)}"
     return 0
   fi
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This foreign server public IP (auto)' "${ST[my_ip]}")"
+  ui_ok "this foreign server public IP: ${ST[my_ip]} (embedded in the token)"
   ST[persona]="$(ui_ask 'persona (auto|cpanel|directadmin|devops)' "${ST[persona]:-auto}")"
   ST[domain]="$(ui_ask 'domain for Lets Encrypt (blank = self-signed)' "${ST[domain]:-}")"
   ST[egress_mode]="$(ui_ask 'egress IP mode (ipv4|ipv6|dual)' "${ST[egress_mode]:-ipv4}")"
@@ -86,10 +89,23 @@ t_hedioum_up() {  # <name>
     if [[ -n "${ST[token]:-}" ]] && systemctl is-active --quiet hedioum.service 2>/dev/null; then
       ui_ok "hedioum egress already configured (token stored)"
     else
-      local -a a=(setup-foreign --persona "${ST[persona]:-auto}")
+      local ip; ip="${ST[my_ip]:-$(sys_public_ip4)}"
+      # real setup-foreign flags (confirmed against the binary's -help):
+      #   --egress-mode (not --egress), --public-ip, --http-decoy-port,
+      #   --listen-port (SSH mimic), --move-ssh, --mimics, --domain, --persona
+      local -a a=(setup-foreign --persona "${ST[persona]:-auto}"
+                  --egress-mode "${ST[egress_mode]:-ipv4}"
+                  --public-ip "$ip"
+                  --http-decoy-port 0)            # keep port 80 free (ACME/x-ui)
       [[ -n "${ST[domain]:-}" ]] && a+=(--domain "${ST[domain]}")
-      [[ -n "${ST[egress_mode]:-}" ]] && a+=(--egress "${ST[egress_mode]}")
-      [[ "${ST[move_ssh]:-no}" == yes ]] && a+=(--move-ssh)
+      if [[ "${ST[move_ssh]:-no}" == yes ]]; then
+        a+=(--move-ssh)                            # relocate real sshd; SSH mimic takes 22
+      else
+        # don't fight the real sshd on :22 — put the SSH mimic on a free high port
+        local sshmimic; sshmimic="$(ports_alloc_public)"
+        a+=(--listen-port "$sshmimic")
+        ST[ssh_mimic_port]="$sshmimic"
+      fi
       [[ -n "${ST[mimics]:-}" ]] && a+=(--mimics "${ST[mimics]}")
       ui_info "running: hedioum-tunnel ${a[*]}"
       local out; out="$(run "$b" "${a[@]}" 2>&1)"
