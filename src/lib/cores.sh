@@ -31,8 +31,10 @@ cores_version() {
 _core_arch() {  # <core> <miliarch>
   local core="$1" a="$2"
   case "$core" in
-    frp|gost|hysteria|singbox|paqet)
+    frp|gost|hysteria|singbox)
       case "$a" in amd64) echo amd64;; arm64) echo arm64;; armv7) echo arm;; *) echo "$a";; esac ;;
+    paqet)
+      case "$a" in amd64) echo amd64;; arm64) echo arm64;; armv7) echo arm32;; *) echo "$a";; esac ;;
     backhaul)
       case "$a" in amd64) echo amd64;; arm64) echo arm64;; *) echo "$a";; esac ;;
     rathole)
@@ -49,7 +51,7 @@ cores_url() {  # <core>
     frp)      echo "https://github.com/fatedier/frp/releases/download/v$v/frp_${v}_linux_${a}.tar.gz" ;;
     backhaul) echo "https://github.com/Musixal/Backhaul/releases/download/v$v/backhaul_linux_${a}.tar.gz" ;;
     gost)     echo "https://github.com/go-gost/gost/releases/download/v$v/gost_${v}_linux_${a}.tar.gz" ;;
-    paqet)    echo "https://github.com/hanselime/paqet/releases/download/v$v/paqet_linux_${a}.tar.gz" ;;
+    paqet)    echo "https://github.com/hanselime/paqet/releases/download/v$v/paqet-linux-${a}-v${v}.tar.gz" ;;
     hedioum)  # raw binaries (no archive): amd64='hedioum-tunnel', else suffixed
               case "$MILI_ARCH" in
                 amd64) echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel" ;;
@@ -114,6 +116,7 @@ cores_install() {  # <core>
 
   for b in $bins; do
     found=$(find "$tmp" -type f -name "$b" 2>/dev/null | head -n1)
+    [[ -z "$found" ]] && found=$(find "$tmp" -type f -name "${b}_linux_*" 2>/dev/null | head -n1)  # paqet_linux_amd64
     [[ -z "$found" ]] && found=$(find "$tmp" -type f -iname "$b*" 2>/dev/null | grep -vi '\.txt$\|\.md$' | head -n1)
     if [[ -z "$found" ]]; then ui_err "binary '$b' not found in $core download"; rm -rf "$tmp"; return 1; fi
     install -m 0755 "$found" "$dst/$b"

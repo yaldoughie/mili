@@ -25,8 +25,10 @@ watchdog_run() {
     # only watch tunnels the operator started (never revive a stopped one)
     [[ "$(st_get state)" == up ]] || continue
     type="$(st_get type)"
-    t_has "$type" health || continue
-    if t_call "$type" health "$name" >/dev/null 2>&1; then
+    # 'probe' = deeper liveness check (watchdog only); 'health' = cheap (menu)
+    local chk=health; t_has "$type" probe && chk=probe
+    t_has "$type" "$chk" || continue
+    if t_call "$type" "$chk" "$name" >/dev/null 2>&1; then
       _wd_fails_set "$name" 0
     else
       fails=$(_wd_fails_get "$name"); fails=$(( ${fails:-0} + 1 ))

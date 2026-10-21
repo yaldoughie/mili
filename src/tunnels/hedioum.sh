@@ -242,43 +242,6 @@ _hed_tunnels() {  # [role] [exclude-name]
   done
 }
 
-_hed_listening() { ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE ":$1\$"; }
-
-# who listens on tcp <port>? prints process name ('?' if hidden); rc 1 = free
-_hed_port_listener() {
-  local line who
-  line="$(ss -Hltnp 2>/dev/null | awk -v p="$1" '{n = split($4, a, ":"); if (a[n] == p) { print; exit }}')"
-  [[ -z "$line" ]] && return 1
-  who="$(printf '%s' "$line" | grep -oE 'users:\(\("[^"]+' | head -n1 | sed 's/^users:(("//')"
-  printf '%s' "${who:-?}"
-}
-
-# is <port> unavailable for a hedioum mimic? prints the reason. hedioum's own
-# listeners don't count (re-setup); MILI_RESERVED is NOT used (443 is a real mimic port)
-_hed_port_busy() {  # <port> [exclude-tunnel]
-  local port="$1" excl="${2:-}" who
-  if who="$(_hed_port_listener "$port")" && [[ "$who" != hedioum* ]]; then
-    printf '%s' "$who"; return 0
-  fi
-  if ports_xui 2>/dev/null | grep -qx "$port"; then printf 'x-ui'; return 0; fi
-  if [[ -f "$MILI_PORTSDB" ]] && awk -F'|' -v pt="$port" -v ex="$excl" '$3==pt && $1!=ex {f=1} END {exit !f}' "$MILI_PORTSDB"; then
-    printf 'another mili tunnel'; return 0
-  fi
-  return 1
-}
-
-# first free public port not in <taken...>
-_hed_free_port() {
-  local p t skip
-  for (( p = MILI_PUB_LO; p <= MILI_PUB_HI; p++ )); do
-    skip=0; for t in "$@"; do [[ "$t" == "$p" ]] && { skip=1; break; }; done
-    (( skip )) && continue
-    ports_in_use "$p" && continue
-    printf '%s' "$p"; return 0
-  done
-  return 1
-}
-
 _hed_sshd_port() { ports_sshd 2>/dev/null | head -n1; }
 
 # the operator's SSH session is proxied by hedioum's SSH mimic (sshd sees 127.0.0.1)
@@ -380,23 +343,6 @@ t_hedioum_wizard() {  # <role> [level]
   if [[ "$1" == foreign ]]; then _hed_wizard_foreign; else _hed_wizard_iran; fi
 }
 
-_hed_ask_port() {  # <prompt> <default>
-  local v
-  while :; do
-    v="$(ui_ask "$1" "$2")"
-    [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )) && { printf '%s' "$v"; return 0; }
-    ui_err "port must be 1-65535" >&2
-  done
-}
-_hed_ask_int() {  # <prompt> <default> <min>
-  local v
-  while :; do
-    v="$(ui_ask "$1" "$2")"
-    [[ "$v" =~ ^[0-9]+$ ]] && (( v >= $3 )) && { printf '%s' "$v"; return 0; }
-    ui_err "enter a whole number >= $3" >&2
-  done
-}
-
 _hed_wizard_foreign() {
   local crole other
   crole="$(_hed_cfg_role)"
@@ -473,13 +419,13 @@ _hed_wizard_foreign() {
   if [[ ",${ST[mimics]}," == *,ssh,* ]]; then
     sshd="$(_hed_sshd_port)"
     while :; do
-      lp="$(_hed_ask_port 'SSH mimic public port' "${ST[ssh_port]:-22}")"
+      lp="$(ui_ask_port 'SSH mimic public port' "${ST[ssh_port]:-22}")"
       if [[ "$lp" == "$sshd" ]]; then
         if ui_confirm "Move OpenSSH off port $lp to free it for the SSH mimic?" y; then
           while :; do
-            dp="$(_hed_ask_port 'Decoy sshd port (OpenSSH is moved here)' "${ST[decoy_port]:-2022}")"
+            dp="$(ui_ask_port 'Decoy sshd port (OpenSSH is moved here)' "${ST[decoy_port]:-2022}")"
             if [[ "$dp" == "$lp" ]]; then ui_err "decoy port must differ from $lp"; continue; fi
-            if who="$(_hed_port_busy "$dp" "${ST[name]}")"; then ui_err "port $dp is busy ($who)"; continue; fi
+            if who="$(ports_busy_reason "$dp" "${ST[name]}" hedioum)"; then ui_err "port $dp is busy ($who)"; continue; fi
             break
           done
           ST[move_ssh]=yes; ST[ssh_moved]=yes; ST[sshd_orig_port]="$lp"; ST[decoy_port]="$dp"
@@ -489,7 +435,7 @@ _hed_wizard_foreign() {
         ui_err "port $lp is OpenSSH's — pick another SSH mimic port (or move OpenSSH)."
         continue
       fi
-      if who="$(_hed_port_busy "$lp" "${ST[name]}")"; then
+      if who="$(ports_busy_reason "$lp" "${ST[name]}" hedioum)"; then
         ui_err "port $lp is busy ($who)."; continue
       fi
       # OpenSSH stays put: the mimic's decoy backend IS the real sshd, so probes see real OpenSSH
@@ -510,11 +456,11 @@ _hed_wizard_foreign() {
     while :; do
       who=''
       if [[ " ${taken[*]} " == *" $p "* ]]; then who="used by another mimic"
-      else who="$(_hed_port_busy "$p" "${ST[name]}")" || who=''; fi
+      else who="$(ports_busy_reason "$p" "${ST[name]}" hedioum)" || who=''; fi
       [[ -z "$who" ]] && break
-      alt="$(_hed_free_port "${taken[@]}")"
+      alt="$(ports_free_public "${taken[@]}")"
       ui_warn "$m mimic port $p is busy ($who)."
-      p="$(_hed_ask_port "Port for the $m mimic" "$alt")"
+      p="$(ui_ask_port "Port for the $m mimic" "$alt")"
     done
     taken+=("$p")
     if [[ "$p" == "$def" ]]; then unset "ST[$k]"; else ST[$k]="$p"; fi
@@ -633,18 +579,18 @@ _hed_wizard_iran() {
   # 3) local SOCKS5 port (the 3x-ui outbound target)
   local p who
   while :; do
-    p="$(_hed_ask_port 'Local SOCKS5 port (for the 3x-ui outbound)' "${ST[socks_port]:-$(ports_alloc_socks "${ST[name]}")}")"
-    if [[ "$p" != "${ST[socks_port]:-}" ]] && who="$(_hed_port_listener "$p")"; then ui_err "port $p is busy ($who)"; continue; fi
-    if who="$(_hed_port_busy "$p" "${ST[name]}")"; then ui_err "port $p is busy ($who)"; continue; fi
+    p="$(ui_ask_port 'Local SOCKS5 port (for the 3x-ui outbound)' "${ST[socks_port]:-$(ports_alloc_socks "${ST[name]}")}")"
+    if [[ "$p" != "${ST[socks_port]:-}" ]] && who="$(ports_who "$p")"; then ui_err "port $p is busy ($who)"; continue; fi
+    if who="$(ports_busy_reason "$p" "${ST[name]}" hedioum)"; then ui_err "port $p is busy ($who)"; continue; fi
     break
   done
   ST[socks_port]="$p"
 
   # 4) connection pool (hedioum defaults)
-  ST[min]="$(_hed_ask_int 'Min physical connections (warm-up pool)' "${ST[min]:-10}" 1)"
-  ST[max]="$(_hed_ask_int 'Max physical connections (scale limit)' "${ST[max]:-20}" "${ST[min]}")"
-  ST[bw]="$(_hed_ask_int 'Bandwidth limit per connection (Mbps)' "${ST[bw]:-8}" 1)"
-  ST[jitter]="$(_hed_ask_int 'Bandwidth jitter for DPI evasion (Mbps)' "${ST[jitter]:-2}" 0)"
+  ST[min]="$(ui_ask_int 'Min physical connections (warm-up pool)' "${ST[min]:-10}" 1)"
+  ST[max]="$(ui_ask_int 'Max physical connections (scale limit)' "${ST[max]:-20}" "${ST[min]}")"
+  ST[bw]="$(ui_ask_int 'Bandwidth limit per connection (Mbps)' "${ST[bw]:-8}" 1)"
+  ST[jitter]="$(ui_ask_int 'Bandwidth jitter for DPI evasion (Mbps)' "${ST[jitter]:-2}" 0)"
 
   # 5) optional TUN interface
   if ui_confirm "Also expose this node as a TUN network interface? (advanced; SOCKS stays on)" "$([[ "${ST[tun]:-}" == yes ]] && echo y || echo n)"; then
@@ -778,14 +724,14 @@ _hed_verify_foreign() {
   while read -r m p; do
     [[ -z "$p" ]] && continue
     for (( i = 0; i < 6; i++ )); do
-      who="$(_hed_port_listener "$p")" && [[ "$who" == hedioum* || "$who" == '?' ]] && break
+      who="$(ports_who "$p")" && [[ "$who" == hedioum* || "$who" == '?' ]] && break
       who=''; sleep 1
     done
     if [[ -n "$who" ]]; then ui_ok "$m mimic listening on :$p"
-    else ui_err "$m mimic NOT listening on :$p$(w="$(_hed_port_listener "$p")" && echo " (held by $w)")"; bad=1; fi
+    else ui_err "$m mimic NOT listening on :$p$(w="$(ports_who "$p")" && echo " (held by $w)")"; bad=1; fi
   done < <(_hed_cfg_mimics)
   if [[ "${ST[ssh_moved]:-}" == yes ]]; then
-    if _hed_listening "${ST[decoy_port]:-2022}"; then ui_ok "OpenSSH on :${ST[decoy_port]:-2022}"
+    if ports_listening "${ST[decoy_port]:-2022}"; then ui_ok "OpenSSH on :${ST[decoy_port]:-2022}"
     else ui_warn "OpenSSH not seen on :${ST[decoy_port]:-2022} — check before closing this session!"; fi
   fi
   (( bad == 0 )) || ui_note "logs: journalctl -u $HED_UNIT -n 50"
@@ -827,8 +773,8 @@ _hed_provision_iran() {
   [[ "${MILI_DRYRUN:-0}" == 1 ]] && { ui_note "dry-run: verification skipped"; return 0; }
   run systemctl enable "$HED_UNIT" >/dev/null 2>&1 || true
   _hed_wait_active 8 || { ui_err "hedioum.service is not running — see: journalctl -u $HED_UNIT -n 30"; return 1; }
-  for (( i = 0; i < 10; i++ )); do _hed_listening "${ST[socks_port]}" && break; sleep 1; done
-  if ! _hed_listening "${ST[socks_port]}"; then
+  for (( i = 0; i < 10; i++ )); do ports_listening "${ST[socks_port]}" && break; sleep 1; done
+  if ! ports_listening "${ST[socks_port]}"; then
     ui_err "SOCKS 127.0.0.1:${ST[socks_port]} is not listening — see: journalctl -u $HED_UNIT -n 30"; return 1
   fi
   ui_ok "SOCKS5 listening on 127.0.0.1:${ST[socks_port]}"
@@ -864,7 +810,7 @@ t_hedioum_up() {  # <name>
   fw_loopback_guard "$name" tcp "${ST[socks_port]}"
   [[ "${MILI_DRYRUN:-0}" == 1 ]] && return 0
   _hed_wait_active 8 || return 1
-  for (( i = 0; i < 10; i++ )); do _hed_listening "${ST[socks_port]}" && return 0; sleep 1; done
+  for (( i = 0; i < 10; i++ )); do ports_listening "${ST[socks_port]}" && return 0; sleep 1; done
   ui_err "SOCKS 127.0.0.1:${ST[socks_port]} not listening"; return 1
 }
 
@@ -925,10 +871,10 @@ t_hedioum_health() {  # <name>
   st_load "$1"
   svc_active "$HED_UNIT" || return 1
   if [[ "${ST[role]}" == iran ]]; then
-    _hed_listening "${ST[socks_port]:-0}"
+    ports_listening "${ST[socks_port]:-0}"
   else
     local m p
-    while read -r m p; do [[ -n "$p" ]] && { _hed_listening "$p" || return 1; }; done < <(_hed_cfg_mimics 2>/dev/null)
+    while read -r m p; do [[ -n "$p" ]] && { ports_listening "$p" || return 1; }; done < <(_hed_cfg_mimics 2>/dev/null)
     return 0
   fi
 }
@@ -988,7 +934,7 @@ t_hedioum_test() {
     local m p
     while read -r m p; do
       [[ -z "$p" ]] && continue
-      if _hed_listening "$p"; then ui_ok "$m :$p listening"; else ui_err "$m :$p NOT listening"; fi
+      if ports_listening "$p"; then ui_ok "$m :$p listening"; else ui_err "$m :$p NOT listening"; fi
     done < <(_hed_cfg_mimics 2>/dev/null)
     [[ -n "$b" ]] && { run "$b" check-ip 2>&1 | sed 's/^/    /' || true; }
   fi

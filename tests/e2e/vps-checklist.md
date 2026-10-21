@@ -38,6 +38,31 @@ list twice: (A) install mili first then 3x-ui, (B) 3x-ui first then mili.
 - [ ] Adopt: plain `hedioum-tunnel setup-foreign` first, then mili → New →
       Hedioum → Foreign → "Use existing setup" → same token, no restart.
 
+## Backhaul (native values, Musixal installer flow)
+- [ ] Iran: New tunnel → Backhaul → Iran, Enter through every question
+      (SOCKS mode). Summary + "type these on the FOREIGN server" box shows Iran
+      IP, tunnel port, transport, token, SOCKS port.
+- [ ] Foreign: New tunnel → Backhaul → Foreign, type those 4 values, Enter the
+      rest → "connected to Iran" + "exit SOCKS5 ready".
+- [ ] Iran: `curl --socks5-hostname 127.0.0.1:<port> https://api.ipify.org`
+      = foreign IP; manage screen shows "foreign: connected".
+- [ ] Wrong token on Foreign → stays "not connected"; Iran log says
+      `invalid security token`.
+- [ ] Forward mode: ports `443-445,8443=2083` → iptables shows `443:445`;
+      a foreign service is reachable via Iran :8443.
+- [ ] wssmux: self-signed cert created under `/etc/mili/pki/<name>/`.
+
+## paqet (native values, paqet-tunnel deploy-script flow)
+- [ ] `mili cores install paqet` downloads `paqet-linux-<arch>-v<ver>.tar.gz`.
+- [ ] Foreign: New tunnel → paqet → Foreign, Enter through → `/etc/mili/engines/paqet/<name>.yaml`;
+      `iptables -t raw -S MILI-RAW` shows dport+sport NOTRACK;
+      `iptables -t raw -S OUTPUT | grep MILI-RAW` present; RST drop in MILI-OUT.
+- [ ] Iran: New tunnel → paqet → Iran, type IP / port / key → "config OK ·
+      test packet sent", "SOCKS5 ready", "exit IP <foreign>".
+- [ ] Wrong key → "no traffic through the tunnel yet" warning, service stays up.
+- [ ] Stop the foreign paqet → Iran watchdog probe fails → unit restarted after
+      3 checks (see `/var/log/mili/watchdog.log`).
+
 ## Coexistence
 - [ ] All six tunnels **up simultaneously**; `mili ports` reports no conflict.
 - [ ] x-ui panel reachable, inbounds работают, ACME renew on port 80 still works.

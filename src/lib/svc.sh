@@ -32,8 +32,10 @@ LimitNOFILE=1048576"
   # generic engine template: mili-<engine>@<name>
   # launched via: mili _svc <engine> <name>  (reads config, execs core)
   local engines=(frps frpc backhaul paqet rathole hy2 singbox gost socks)
-  local e
+  local e rs
   for e in "${engines[@]}"; do
+    # paqet: same RestartSec as its own deploy script (raw socket needs a beat to free)
+    rs="$common"; [[ "$e" == paqet ]] && rs="${common/RestartSec=3/RestartSec=10}"
     svc_write_unit "mili-$e@.service" "[Unit]
 Description=mili $e tunnel instance %i
 After=network-online.target mili-fw.service
@@ -43,7 +45,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=$MILI_BIN _svc $e %i
-$common
+$rs
 
 [Install]
 WantedBy=multi-user.target"

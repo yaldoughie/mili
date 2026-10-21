@@ -196,6 +196,14 @@ ui_select() {
   tput cnorm 2>/dev/null || true
 }
 
+# ui_pick <preselect-index> <item>... : like ui_select, but a wizard question:
+# cancel / blank answer keeps the preselected item (Enter-default semantics).
+ui_pick() {
+  local pre="${1:-0}"
+  ui_select "$@"
+  (( SEL >= 1 && SEL < $# )) || SEL=$(( pre + 1 ))
+}
+
 # ---- prompts ---------------------------------------------------------------
 # ask <prompt> <default> -> echoes answer
 ui_ask() {
@@ -224,6 +232,41 @@ ui_confirm() {
   read -r -p "$(printf '%s? %s%s %s%s%s ' "$C_YEL" "$C_RST" "$p" "$C_GRY" "$hint" "$C_RST")" ans || true
   ans="${ans:-$def}"
   [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# ask a tcp/udp port (1-65535) -> echoes it
+ui_ask_port() {  # <prompt> <default>
+  local v
+  while :; do
+    v="$(ui_ask "$1" "$2")"
+    [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )) && { printf '%s' "$v"; return 0; }
+    ui_err "port must be 1-65535" >&2
+  done
+}
+
+# ask a whole number in [min, max] -> echoes it
+ui_ask_int() {  # <prompt> <default> <min> [max]
+  local v max="${4:-}"
+  while :; do
+    v="$(ui_ask "$1" "$2")"
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= $3 )) && [[ -z "$max" || "$v" -le "$max" ]]; then
+      printf '%s' "$v"; return 0
+    fi
+    if [[ -n "$max" ]]; then ui_err "enter a whole number $3-$max" >&2; else ui_err "enter a whole number >= $3" >&2; fi
+  done
+}
+
+# ask true/false (also accepts y/n/yes/no/1/0) -> echoes true|false
+ui_ask_bool() {  # <prompt> <default true|false>
+  local v
+  while :; do
+    v="$(ui_ask "$1 (true/false)" "$2")"
+    case "${v,,}" in
+      true|t|y|yes|1)  printf 'true';  return 0 ;;
+      false|f|n|no|0)  printf 'false'; return 0 ;;
+    esac
+    ui_err "enter true or false" >&2
+  done
 }
 
 # pause until Enter
@@ -665,6 +708,47 @@ ports_alloc_public()   { ports_alloc "$MILI_PUB_LO"   "$MILI_PUB_HI"   "$1"; }
 ports_alloc_socks()    { ports_alloc "$MILI_SOCKS_LO" "$MILI_SOCKS_HI" "$1"; }
 ports_alloc_internal() { ports_alloc "$MILI_INT_LO"   "$MILI_INT_HI"   "$1"; }
 
+# ---- live listener helpers (wizards) ----------------------------------------
+# is anything listening on tcp <port>?
+ports_listening() { ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE ":$1\$"; }
+
+# who listens on tcp <port>? prints the process name ('?' if hidden); rc 1 = free
+ports_who() {
+  local line who
+  line="$(ss -Hltnp 2>/dev/null | awk -v p="$1" '{n = split($4, a, ":"); if (a[n] == p) { print; exit }}')"
+  [[ -z "$line" ]] && return 1
+  who="$(printf '%s' "$line" | grep -oE 'users:\(\("[^"]+' | head -n1 | sed 's/^users:(("//')"
+  printf '%s' "${who:-?}"
+}
+
+# is <port> unavailable? prints the reason (process / x-ui / another mili tunnel).
+# Listeners whose process name starts with <ignore-prefix> don't count (a core
+# re-binding its own port). MILI_RESERVED is NOT consulted (callers decide).
+ports_busy_reason() {  # <port> [exclude-tunnel] [ignore-prefix]
+  local port="$1" excl="${2:-}" ign="${3:-}" who
+  if who="$(ports_who "$port")"; then
+    if [[ -z "$ign" || "$who" != "$ign"* ]]; then printf '%s' "$who"; return 0; fi
+  fi
+  if ports_xui 2>/dev/null | grep -qx "$port"; then printf 'x-ui'; return 0; fi
+  if [[ -f "$MILI_PORTSDB" ]] && awk -F'|' -v pt="$port" -v ex="$excl" '$3==pt && $1!=ex {f=1} END {exit !f}' "$MILI_PORTSDB"; then
+    printf 'another mili tunnel'; return 0
+  fi
+  return 1
+}
+
+# first free port in [lo, hi] that is not in <taken...>
+ports_free_in() {  # <lo> <hi> [taken...]
+  local lo="$1" hi="$2" p t skip; shift 2
+  for (( p = lo; p <= hi; p++ )); do
+    skip=0; for t in "$@"; do [[ "$t" == "$p" ]] && { skip=1; break; }; done
+    (( skip )) && continue
+    ports_in_use "$p" && continue
+    printf '%s' "$p"; return 0
+  done
+  return 1
+}
+ports_free_public() { ports_free_in "$MILI_PUB_LO" "$MILI_PUB_HI" "$@"; }
+
 # ---- claim / release -------------------------------------------------------
 ports_claim() {   # <name> <proto> <port> <bind>
   ports_db_init
@@ -796,18 +880,23 @@ fw_rehook() {
   # mangle FORWARD -> MSS clamp
   _iptq  -t mangle -C FORWARD -j MILI-MSS || _ipt  -t mangle -I FORWARD 1 -j MILI-MSS
   _ipt6q -t mangle -C FORWARD -j MILI-MSS || _ipt6 -t mangle -I FORWARD 1 -j MILI-MSS
-  # raw PREROUTING -> MILI-RAW  (paqet NOTRACK)
+  # raw PREROUTING + OUTPUT -> MILI-RAW  (paqet NOTRACK: --dport in, --sport out)
   _iptq  -t raw -C PREROUTING -j MILI-RAW || _ipt  -t raw -I PREROUTING 1 -j MILI-RAW
+  _iptq  -t raw -C OUTPUT     -j MILI-RAW || _ipt  -t raw -I OUTPUT 1 -j MILI-RAW
   # mangle OUTPUT -> MILI-OUT (paqet RST drop)
   _iptq  -t mangle -C OUTPUT -j MILI-OUT || _ipt -t mangle -I OUTPUT 1 -j MILI-OUT
 }
 
 # add a filter ACCEPT:  fw_allow <name> <proto> <port|range> [src]
+# a range may be given as a-b (backhaul/ports syntax) or a:b (iptables syntax)
 fw_allow() {
-  local name="$1" proto="$2" port="$3" src="${4:-}" tag="$FW_TAGPFX:$1"
+  local name="$1" proto="$2" port="${3:-}" src="${4:-}" tag="$FW_TAGPFX:$1"
+  [[ "$port" == - ]] && port=''
+  [[ "$port" =~ ^[0-9]+-[0-9]+$ ]] && port="${port/-/:}"
+  [[ "$src" == any ]] && src=''
   local -a a=(-t filter -A MILI-IN -p "$proto")
-  [[ -n "$src" && "$src" != any ]] && a+=(-s "$src")
-  [[ -n "$port" && "$port" != - ]] && a+=(--dport "$port")
+  [[ -n "$src" ]] && a+=(-s "$src")
+  [[ -n "$port" ]] && a+=(--dport "$port")
   a+=(-m comment --comment "$tag" -j ACCEPT)
   _iptq -t filter -C MILI-IN -p "$proto" ${src:+-s "$src"} ${port:+--dport "$port"} -m comment --comment "$tag" -j ACCEPT \
     || _ipt "${a[@]}"
@@ -899,6 +988,7 @@ fw_teardown() {
   _iptq  -t nat -D POSTROUTING -j MILI-POST; _ipt6q -t nat -D POSTROUTING -j MILI-POST
   _iptq  -t mangle -D FORWARD -j MILI-MSS; _ipt6q -t mangle -D FORWARD -j MILI-MSS
   _iptq  -t raw -D PREROUTING -j MILI-RAW
+  _iptq  -t raw -D OUTPUT -j MILI-RAW
   _iptq  -t mangle -D OUTPUT -j MILI-OUT
   for table in filter nat mangle raw; do
     for chain in MILI-IN MILI-PRE MILI-POST MILI-MSS MILI-OUT MILI-RAW; do
@@ -967,8 +1057,10 @@ LimitNOFILE=1048576"
   # generic engine template: mili-<engine>@<name>
   # launched via: mili _svc <engine> <name>  (reads config, execs core)
   local engines=(frps frpc backhaul paqet rathole hy2 singbox gost socks)
-  local e
+  local e rs
   for e in "${engines[@]}"; do
+    # paqet: same RestartSec as its own deploy script (raw socket needs a beat to free)
+    rs="$common"; [[ "$e" == paqet ]] && rs="${common/RestartSec=3/RestartSec=10}"
     svc_write_unit "mili-$e@.service" "[Unit]
 Description=mili $e tunnel instance %i
 After=network-online.target mili-fw.service
@@ -978,7 +1070,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=$MILI_BIN _svc $e %i
-$common
+$rs
 
 [Install]
 WantedBy=multi-user.target"
@@ -1241,8 +1333,10 @@ cores_version() {
 _core_arch() {  # <core> <miliarch>
   local core="$1" a="$2"
   case "$core" in
-    frp|gost|hysteria|singbox|paqet)
+    frp|gost|hysteria|singbox)
       case "$a" in amd64) echo amd64;; arm64) echo arm64;; armv7) echo arm;; *) echo "$a";; esac ;;
+    paqet)
+      case "$a" in amd64) echo amd64;; arm64) echo arm64;; armv7) echo arm32;; *) echo "$a";; esac ;;
     backhaul)
       case "$a" in amd64) echo amd64;; arm64) echo arm64;; *) echo "$a";; esac ;;
     rathole)
@@ -1259,7 +1353,7 @@ cores_url() {  # <core>
     frp)      echo "https://github.com/fatedier/frp/releases/download/v$v/frp_${v}_linux_${a}.tar.gz" ;;
     backhaul) echo "https://github.com/Musixal/Backhaul/releases/download/v$v/backhaul_linux_${a}.tar.gz" ;;
     gost)     echo "https://github.com/go-gost/gost/releases/download/v$v/gost_${v}_linux_${a}.tar.gz" ;;
-    paqet)    echo "https://github.com/hanselime/paqet/releases/download/v$v/paqet_linux_${a}.tar.gz" ;;
+    paqet)    echo "https://github.com/hanselime/paqet/releases/download/v$v/paqet-linux-${a}-v${v}.tar.gz" ;;
     hedioum)  # raw binaries (no archive): amd64='hedioum-tunnel', else suffixed
               case "$MILI_ARCH" in
                 amd64) echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel" ;;
@@ -1324,6 +1418,7 @@ cores_install() {  # <core>
 
   for b in $bins; do
     found=$(find "$tmp" -type f -name "$b" 2>/dev/null | head -n1)
+    [[ -z "$found" ]] && found=$(find "$tmp" -type f -name "${b}_linux_*" 2>/dev/null | head -n1)  # paqet_linux_amd64
     [[ -z "$found" ]] && found=$(find "$tmp" -type f -iname "$b*" 2>/dev/null | grep -vi '\.txt$\|\.md$' | head -n1)
     if [[ -z "$found" ]]; then ui_err "binary '$b' not found in $core download"; rm -rf "$tmp"; return 1; fi
     install -m 0755 "$found" "$dst/$b"
@@ -1461,7 +1556,11 @@ socks_exec() {  # <name>
   . "$f"
   gost="$(cores_path gost)"
   [[ -x "$gost" ]] || die "gost core not installed"
-  exec "$gost" -L "socks5://${SOCKS_USER}:${SOCKS_PASS}@${SOCKS_BIND}:${SOCKS_PORT}?udp=true"
+  if [[ -n "${SOCKS_USER:-}" ]]; then
+    exec "$gost" -L "socks5://${SOCKS_USER}:${SOCKS_PASS}@${SOCKS_BIND}:${SOCKS_PORT}?udp=true"
+  fi
+  # no user = no auth (loopback-only helper reached only through the tunnel)
+  exec "$gost" -L "socks5://${SOCKS_BIND}:${SOCKS_PORT}?udp=true"
 }
 
 socks_remove() { run rm -f "$MILI_SOCKS_DIR/$1.env" 2>/dev/null || true; }
@@ -1603,8 +1702,10 @@ watchdog_run() {
     # only watch tunnels the operator started (never revive a stopped one)
     [[ "$(st_get state)" == up ]] || continue
     type="$(st_get type)"
-    t_has "$type" health || continue
-    if t_call "$type" health "$name" >/dev/null 2>&1; then
+    # 'probe' = deeper liveness check (watchdog only); 'health' = cheap (menu)
+    local chk=health; t_has "$type" probe && chk=probe
+    t_has "$type" "$chk" || continue
+    if t_call "$type" "$chk" "$name" >/dev/null 2>&1; then
       _wd_fails_set "$name" 0
     else
       fails=$(_wd_fails_get "$name"); fails=$(( ${fails:-0} + 1 ))
@@ -1804,18 +1905,29 @@ backup_restore() {  # <tar.gz>
 
 # ===== tunnels/backhaul.sh =====
 # shellcheck shell=bash
-# mili :: tunnels/backhaul.sh - Musixal/Backhaul (open-source only).
-# server = IRAN (listens public tunnel port), client = FOREIGN (dials).
-# SOCKS mode: foreign runs mili-socks (gost); Backhaul forwards an Iran port to
-# it. skip_optz=true ALWAYS (protects the ephemeral range used by xray).
+# mili :: tunnels/backhaul.sh - Musixal/Backhaul v0.7.2 (open-source core).
 #
-# roles: iran (server) | foreign (client)
+# NATIVE flow (no mili pairing code): mili asks the same questions as Musixal's
+# own Backhaul installer, in the same order, every one with an Enter default.
+#   IRAN    = [server] - listens on the tunnel port            (set up first)
+#   FOREIGN = [client] - "Kharej", dials Iran with the values Iran shows:
+#             Iran IP, tunnel port, transport, security token
+#
+# Usage on top of Backhaul (mili addition, asked last):
+#   socks   - Iran 127.0.0.1:<iran_socks> -> foreign 127.0.0.1:<foreign_socks>,
+#             where mili runs a loopback-only gost SOCKS5 (no auth, nothing to
+#             carry). 3x-ui on Iran adds 127.0.0.1:<iran_socks> as an outbound.
+#   forward - Musixal's ports list (Iran public ports -> foreign targets).
+#
+# skip_optz=true ALWAYS: Backhaul's optimizer widens ip_local_port_range to
+# 1024-65535 and would collide with xray / x-ui ports.
 # config: /etc/mili/engines/backhaul/<name>.toml
 
 t_register backhaul
 feature "tunnel.backhaul" free
 
 MILI_BH_ETC="$MILI_ETC/engines/backhaul"
+BH_TRANSPORTS=(tcp tcpmux ws wss wsmux wssmux udp)
 
 t_backhaul_meta() {
   echo "id=backhaul"
@@ -1823,178 +1935,477 @@ t_backhaul_meta() {
   echo "tier=free"
   echo "layer=fwd"
   echo "roles=iran foreign"
-  echo "primary=iran"     # iran = server (listener) generates; foreign dials in
-  echo "twoway=no"        # foreign only needs iran's IP (carried in the code)
+  echo "primary=iran"
+  echo "pairing=native"
+  echo "handoff_label=Show values for the foreign server"
+  echo "first_hint=Set up the IRAN server first (it listens). Then on the FOREIGN server pick Backhaul → Foreign and type the values Iran shows."
   echo "cores=backhaul"
-}
-
-t_backhaul_wizard() {  # <role> <level>  (runs on iran = the listener/generator)
-  local role="$1" level="$2"
-  ST[my_ip]="$(sys_public_ip4)"
-  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This Iran server public IP (auto-detected)' "${ST[my_ip]}")"
-  ui_ok "this Iran server's public IP: ${ST[my_ip]}  (foreign will dial it)"
-  ST[tunnel_port]="$(ui_ask 'Public tunnel port (Iran listens)' "${ST[tunnel_port]:-$(ports_alloc_public)}")"
-  [[ -z "${ST[token]:-}" ]] && ST[token]="$(sys_rand_token 24)"
-
-  echo; ui_info "transport: tcp tcpmux ws wss wsmux wssmux udp"
-  ST[transport]="$(ui_ask 'transport' "${ST[transport]:-tcp}")"
-
-  echo; ui_info "Usage mode: 1) socks  2) forward"
-  local um; um="$(ui_ask 'mode' "${ST[mode]:-1}")"
-  case "$um" in 2) ST[mode]=forward;; *) ST[mode]=socks;; esac
-  case "${ST[mode]}" in
-    socks)
-      ST[iran_socks]="${ST[iran_socks]:-$(ports_alloc_socks)}"
-      ST[foreign_socks]="${ST[foreign_socks]:-$(sys_rand_port 10800 10999)}"
-      [[ -z "${ST[socks_user]:-}" ]] && ST[socks_user]="mili"
-      [[ -z "${ST[socks_pass]:-}" ]] && ST[socks_pass]="$(sys_rand_token 18)" ;;
-    forward)
-      ST[fwd]="$(ui_ask 'ports spec (backhaul syntax, comma)  e.g. 8443=443,2083=127.0.0.1:2083' "${ST[fwd]:-}")" ;;
-  esac
-
-  if [[ "$level" == advanced ]]; then
-    ST[nodelay]="$(ui_ask 'nodelay true/false' "${ST[nodelay]:-true}")"
-    ST[keepalive]="$(ui_ask 'keepalive_period (s)' "${ST[keepalive]:-75}")"
-    ST[heartbeat]="$(ui_ask 'heartbeat (s)' "${ST[heartbeat]:-40}")"
-    ST[mux_con]="$(ui_ask 'mux_con' "${ST[mux_con]:-8}")"
-    ST[conn_pool]="$(ui_ask 'connection_pool' "${ST[conn_pool]:-8}")"
-    [[ "${ST[transport]}" == wss* ]] && ST[domain]="$(ui_ask 'TLS domain (optional, blank=self-signed)' "${ST[domain]:-}")"
-  else
-    ST[nodelay]="${ST[nodelay]:-true}"; ST[keepalive]="${ST[keepalive]:-75}"
-    ST[heartbeat]="${ST[heartbeat]:-40}"; ST[mux_con]="${ST[mux_con]:-8}"; ST[conn_pool]="${ST[conn_pool]:-8}"
-  fi
-  return 0
-}
-
-_bh_ports_line() {  # build the ports = [...] array contents
-  st_load "$1"
-  if [[ "${ST[mode]}" == socks ]]; then
-    printf '"%s=%s"' "${ST[iran_socks]}" "${ST[foreign_socks]}"
-  else
-    local item out='' first=1
-    IFS=',' read -ra items <<<"${ST[fwd]}"
-    for item in "${items[@]}"; do
-      [[ -z "$item" ]] && continue
-      [[ $first -eq 1 ]] && first=0 || out+=", "
-      out+="\"$item\""
-    done
-    printf '%s' "$out"
-  fi
-}
-
-_bh_tls() {  # emit tls cert/key lines for wss* transports
-  st_load "$1"
-  [[ "${ST[transport]}" == wss* ]] || return 0
-  local crt key dir="$MILI_ETC/pki/$1"
-  if [[ -n "${ST[domain]:-}" && -f "/root/cert/${ST[domain]}/fullchain.pem" ]]; then
-    crt="/root/cert/${ST[domain]}/fullchain.pem"; key="/root/cert/${ST[domain]}/privkey.pem"
-  else
-    crt="$dir/cert.pem"; key="$dir/key.pem"
-    if [[ ! -f "$crt" && "${MILI_DRYRUN:-0}" != 1 ]]; then
-      mkdir -p "$dir"
-      openssl req -x509 -newkey rsa:2048 -keyout "$key" -out "$crt" -days 3650 -nodes \
-        -subj "/CN=${ST[domain]:-mili.local}" >/dev/null 2>&1 || true
-    fi
-  fi
-  printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$crt" "$key"
-}
-
-t_backhaul_render() {  # <name>
-  st_load "$1"; local name="$1" f; f="$MILI_BH_ETC/$name.toml"
-  run mkdir -p "$MILI_BH_ETC"
-  [[ "${MILI_DRYRUN:-0}" == 1 ]] && { ui_info "[dry] backhaul config for $name (role ${ST[role]})"; return 0; }
-  if [[ "${ST[role]}" == iran ]]; then
-    {
-      echo "# mili Backhaul server (Iran) tunnel $name"
-      echo "[server]"
-      echo "bind_addr = \"0.0.0.0:${ST[tunnel_port]}\""
-      echo "transport = \"${ST[transport]}\""
-      echo "token = \"${ST[token]}\""
-      echo "keepalive_period = ${ST[keepalive]}"
-      echo "nodelay = ${ST[nodelay]}"
-      echo "heartbeat = ${ST[heartbeat]}"
-      echo "mux_con = ${ST[mux_con]}"
-      echo "channel_size = 2048"
-      echo "sniffer = false"
-      echo "web_port = 0"
-      echo "skip_optz = true"
-      _bh_tls "$name"
-      echo "ports = [ $(_bh_ports_line "$name") ]"
-    } >"$f"
-  else
-    {
-      echo "# mili Backhaul client (Foreign) tunnel $name"
-      echo "[client]"
-      echo "remote_addr = \"${ST[iran_ip]}:${ST[tunnel_port]}\""
-      echo "transport = \"${ST[transport]}\""
-      echo "token = \"${ST[token]}\""
-      echo "keepalive_period = ${ST[keepalive]}"
-      echo "nodelay = ${ST[nodelay]}"
-      echo "connection_pool = ${ST[conn_pool]}"
-      echo "sniffer = false"
-      echo "web_port = 0"
-      echo "skip_optz = true"
-      [[ "${ST[transport]}" == wss* ]] && echo "edge_ip = \"\""
-    } >"$f"
-  fi
-  chmod 600 "$f"
 }
 
 t_backhaul_unit() { echo "mili-backhaul@$1.service"; }
 
+# ============================================================================
+# pure helpers (unit-tested)
+# ============================================================================
+_bh_is_mux() { [[ "$1" == tcpmux || "$1" == wsmux || "$1" == wssmux ]]; }
+_bh_is_ws()  { [[ "$1" == ws || "$1" == wss || "$1" == wsmux || "$1" == wssmux ]]; }
+_bh_is_tls() { [[ "$1" == wss || "$1" == wssmux ]]; }
+_bh_valid_transport() { local t; for t in "${BH_TRANSPORTS[@]}"; do [[ "$t" == "$1" ]] && return 0; done; return 1; }
+
+# default SOCKS port on the foreign side, derived from the tunnel port so BOTH
+# servers suggest the same number (Enter on both sides just works)
+_bh_socks_default() { printf '%s' $(( 10800 + ${1:-0} % 200 )); }
+
+# host:port, IPv6 bracketed
+_bh_hostport() {  # <host> <port>
+  local h="${1#[}"; h="${h%]}"
+  if [[ "$h" == *:* ]]; then printf '[%s]:%s' "$h" "$2"; else printf '%s:%s' "$h" "$2"; fi
+}
+
+# a security token must be a plain TOML string (no quotes / backslashes / spaces)
+_bh_valid_token() { local re='^[^"\\[:space:]]+$'; [[ -n "$1" && "$1" =~ $re ]]; }
+
+# one item of Musixal's ports list, in the forms the v0.7.2 core accepts:
+#   443   443-600   4000=5000   443-600=5201   443=1.1.1.1:5201
+#   443-600=1.1.1.1:5201   127.0.0.2:443=5201   127.0.0.2:443=1.1.1.1:5201
+_bh_fwd_valid() {
+  local it="$1" ip='[0-9]{1,3}(\.[0-9]{1,3}){3}' host='[A-Za-z0-9.-]+'
+  local local_re="^([0-9]+(-[0-9]+)?|${ip}:[0-9]+)\$"
+  local remote_re="^([0-9]+|(${host}):[0-9]+)\$"
+  local l r
+  if [[ "$it" == *=* ]]; then
+    l="${it%%=*}"; r="${it#*=}"
+    [[ "$l" =~ $local_re && "$r" =~ $remote_re ]] || return 1
+  else
+    [[ "$it" =~ ^[0-9]+(-[0-9]+)?$ ]] || return 1
+    l="$it"
+  fi
+  # port bounds (and a range must go up)
+  local lp="${l##*:}" a b
+  a="${lp%%-*}"; b="${lp##*-}"
+  (( a >= 1 && a <= 65535 && b >= 1 && b <= 65535 && b >= a )) || return 1
+  return 0
+}
+
+# local side of an item -> "<bind> <port-or-range>"   (bind 0.0.0.0 unless given)
+_bh_fwd_local() {
+  local l="${1%%=*}"
+  if [[ "$l" == *:* ]]; then printf '%s %s' "${l%:*}" "${l##*:}"; else printf '0.0.0.0 %s' "$l"; fi
+}
+
+# items of a comma list, one per line
+_bh_fwd_items() {
+  local it; local -a _bhi=()
+  IFS=',' read -ra _bhi <<<"${1// /}"
+  for it in "${_bhi[@]}"; do [[ -n "$it" ]] && printf '%s\n' "$it"; done
+  return 0
+}
+
+# "ports = [ ... ]" body
+_bh_ports_block() {
+  if [[ "${ST[mode]}" == socks ]]; then
+    printf '    "127.0.0.1:%s=%s",\n' "${ST[iran_socks]}" "${ST[foreign_socks]}"
+  else
+    local it; while read -r it; do printf '    "%s",\n' "$it"; done < <(_bh_fwd_items "${ST[fwd]:-}")
+  fi
+}
+
+# TLS cert/key for wss/wssmux: a real cert for the domain if one exists
+# (3x-ui's /root/cert/<domain>/ or certbot's live dir), else mili's self-signed
+_bh_tls_paths() {  # <name> -> "cert key"
+  local d="${ST[domain]:-}"
+  if [[ -n "$d" && -f "/root/cert/$d/fullchain.pem" && -f "/root/cert/$d/privkey.pem" ]]; then
+    printf '%s %s' "/root/cert/$d/fullchain.pem" "/root/cert/$d/privkey.pem"
+  elif [[ -n "$d" && -f "/etc/letsencrypt/live/$d/fullchain.pem" ]]; then
+    printf '%s %s' "/etc/letsencrypt/live/$d/fullchain.pem" "/etc/letsencrypt/live/$d/privkey.pem"
+  else
+    printf '%s %s' "$MILI_ETC/pki/$1/cert.pem" "$MILI_ETC/pki/$1/key.pem"
+  fi
+}
+
+# the TOML (Musixal installer layout). Unset keys fall back to the core's own
+# defaults (e.g. mux_version 1), so tunnels created before this flow render as before.
+_bh_toml() {  # <name>
+  local name="$1" t="${ST[transport]:-tcp}" nd="${ST[nodelay]:-true}"
+  [[ "$t" == udp ]] && nd=false
+  local log="$MILI_LOGDIR/backhaul-$name.json"
+  if [[ "${ST[role]}" == iran ]]; then
+    printf '# mili Backhaul server (Iran) - tunnel %s\n' "$name"
+    printf '[server]\n'
+    printf 'bind_addr = ":%s"\n' "${ST[tunnel_port]}"
+    printf 'transport = "%s"\n' "$t"
+    printf 'accept_udp = %s\n' "${ST[accept_udp]:-false}"
+    printf 'token = "%s"\n' "${ST[token]}"
+    printf 'keepalive_period = %s\n' "${ST[keepalive]:-75}"
+    printf 'nodelay = %s\n' "$nd"
+    printf 'channel_size = %s\n' "${ST[channel_size]:-2048}"
+    printf 'heartbeat = %s\n' "${ST[heartbeat]:-40}"
+    printf 'mux_con = %s\n' "${ST[mux_con]:-8}"
+    printf 'mux_version = %s\n' "${ST[mux_version]:-1}"
+    printf 'mux_framesize = 32768\n'
+    printf 'mux_recievebuffer = 4194304\n'
+    printf 'mux_streambuffer = 2000000\n'
+    printf 'sniffer = %s\n' "${ST[sniffer]:-false}"
+    printf 'web_port = %s\n' "${ST[web_port]:-0}"
+    printf 'sniffer_log = "%s"\n' "$log"
+    printf 'log_level = "info"\n'
+    printf 'proxy_protocol = %s\n' "${ST[proxy_protocol]:-false}"
+    printf 'skip_optz = true\n'
+    if _bh_is_tls "$t"; then
+      local crt key; read -r crt key <<<"$(_bh_tls_paths "$name")"
+      printf 'tls_cert = "%s"\n' "$crt"
+      printf 'tls_key = "%s"\n' "$key"
+    fi
+    printf '\nports = [\n'
+    _bh_ports_block
+    printf ']\n'
+  else
+    printf '# mili Backhaul client (Foreign) - tunnel %s\n' "$name"
+    printf '[client]\n'
+    printf 'remote_addr = "%s"\n' "$(_bh_hostport "${ST[iran_ip]}" "${ST[tunnel_port]}")"
+    if _bh_is_ws "$t" && [[ -n "${ST[edge_ip]:-}" ]]; then printf 'edge_ip = "%s"\n' "${ST[edge_ip]}"; fi
+    printf 'transport = "%s"\n' "$t"
+    printf 'token = "%s"\n' "${ST[token]}"
+    printf 'connection_pool = %s\n' "${ST[conn_pool]:-8}"
+    printf 'aggressive_pool = false\n'
+    printf 'keepalive_period = %s\n' "${ST[keepalive]:-75}"
+    printf 'nodelay = %s\n' "$nd"
+    printf 'retry_interval = 3\n'
+    printf 'dial_timeout = 10\n'
+    printf 'mux_version = %s\n' "${ST[mux_version]:-1}"
+    printf 'mux_framesize = 32768\n'
+    printf 'mux_recievebuffer = 4194304\n'
+    printf 'mux_streambuffer = 2000000\n'
+    printf 'sniffer = %s\n' "${ST[sniffer]:-false}"
+    printf 'web_port = %s\n' "${ST[web_port]:-0}"
+    printf 'sniffer_log = "%s"\n' "$log"
+    printf 'log_level = "info"\n'
+    printf 'skip_optz = true\n'
+  fi
+}
+
+# ============================================================================
+# wizard (Musixal's question order)
+# ============================================================================
+t_backhaul_wizard() {  # <role> [level]
+  if [[ "$1" == iran ]]; then _bh_wizard_iran; else _bh_wizard_foreign; fi
+}
+
+_bh_reserved() { local r; for r in "${MILI_RESERVED[@]}"; do [[ "$r" == "$1" ]] && return 0; done; return 1; }
+
+_bh_transport_hint() {
+  case "$1" in
+    tcp)    printf 'plain TCP · fastest' ;;
+    tcpmux) printf 'TCP + multiplexing' ;;
+    ws)     printf 'WebSocket (CDN-able)' ;;
+    wss)    printf 'WebSocket over TLS' ;;
+    wsmux)  printf 'WebSocket + multiplexing' ;;
+    wssmux) printf 'WebSocket TLS + multiplexing' ;;
+    udp)    printf 'UDP (carries UDP traffic only)' ;;
+  esac
+}
+
+_bh_ask_transport() {
+  local -a labels=(); local i pre=0
+  for i in "${!BH_TRANSPORTS[@]}"; do
+    [[ "${BH_TRANSPORTS[$i]}" == "${ST[transport]:-tcp}" ]] && pre=$i
+    labels+=("${BH_TRANSPORTS[$i]}"$'\t'"$(_bh_transport_hint "${BH_TRANSPORTS[$i]}")")
+  done
+  echo; ui_info "Transport type (must be the same on both servers):"
+  ui_pick "$pre" "${labels[@]}"
+  ST[transport]="${BH_TRANSPORTS[$((SEL-1))]}"
+}
+
+# ask a port for something mili will listen on; re-ask while it's taken.
+# <current> = this tunnel's existing value (its own listener doesn't count)
+_bh_ask_free_port() {  # <prompt> <default> <current> <min> [zero]
+  local p who own
+  while :; do
+    p="$(ui_ask_int "$1" "$2" "$4" 65535)"
+    [[ "${5:-}" == zero && "$p" == 0 ]] && { printf '0'; return 0; }
+    own=0; [[ -n "$3" && "$p" == "$3" ]] && own=1
+    if who="$(ports_busy_reason "$p" "${ST[name]}")"; then
+      # re-using this tunnel's own port (Edit): its own backhaul/gost listener is fine
+      if ! (( own )) || [[ "$who" != backhaul* && "$who" != gost* ]]; then
+        ui_err "port $p is in use ($who)" >&2; continue
+      fi
+    fi
+    printf '%s' "$p"; return 0
+  done
+}
+
+_bh_ask_token() {  # <default>
+  local v
+  while :; do
+    v="$(ui_ask '[-] Security token' "$1")"
+    _bh_valid_token "$v" && { printf '%s' "$v"; return 0; }
+    ui_err "enter the token (no spaces, quotes or backslashes)" >&2
+  done
+}
+
+_bh_ports_help() {
+  echo; ui_info "Supported port formats:"
+  ui_note "443                   listen on 443, forward to the foreign server's 443"
+  ui_note "443-600               listen on every port 443..600 (same port on foreign)"
+  ui_note "4000=5000             listen on 4000, forward to foreign port 5000"
+  ui_note "443-600=5201          listen on 443..600, forward all to foreign 5201"
+  ui_note "443=1.1.1.1:5201      listen on 443, the foreign side dials 1.1.1.1:5201"
+  ui_note "127.0.0.2:443=5201    bind a specific local IP"
+}
+
+# validate a whole ports list: formats + Iran-side listen ports free
+_bh_fwd_check() {  # <list>
+  local it bind lp a b p who n=0 own
+  while read -r it; do
+    ((n++))
+    _bh_fwd_valid "$it" || { ui_err "invalid port mapping: $it"; return 1; }
+    read -r bind lp <<<"$(_bh_fwd_local "$it")"
+    a="${lp%%-*}"; b="${lp##*-}"
+    own=0; [[ ",${ST[fwd]:-}," == *",$it,"* ]] && own=1     # unchanged item on Edit
+    for (( p = a; p <= b; p++ )); do
+      if [[ "$p" == "${ST[tunnel_port]}" || "$p" == "${ST[web_port]:-0}" ]]; then
+        ui_err "port $p is the tunnel/web port - pick other listen ports"; return 1
+      fi
+      (( b - a > 200 )) && continue      # very wide ranges: not probed port by port
+      if who="$(ports_busy_reason "$p" "${ST[name]}")" && ! { (( own )) && [[ "$who" == backhaul* ]]; }; then
+        ui_err "listen port $p is in use ($who)"; return 1
+      fi
+    done
+  done < <(_bh_fwd_items "$1")
+  (( n > 0 )) || { ui_err "enter at least one port"; return 1; }
+  return 0
+}
+
+_bh_ask_usage() {  # sets ST[mode]
+  if [[ "${ST[transport]}" == udp ]]; then
+    ST[mode]=forward
+    ui_note "udp transport carries UDP only -> port forward mode (SOCKS needs a TCP transport)."
+    return 0
+  fi
+  local pre=0; [[ "${ST[mode]:-socks}" == forward ]] && pre=1
+  echo; ui_info "How will this tunnel be used? (same choice on both servers)"
+  ui_pick "$pre" $'SOCKS outbound for 3x-ui\trecommended · x-ui on Iran → SOCKS → foreign exit' \
+                 $'Port forward\tBackhaul ports list · Iran ports → foreign'
+  if (( SEL == 2 )); then ST[mode]=forward; else ST[mode]=socks; fi
+}
+
+_bh_wizard_iran() {
+  ST[my_ip]="$(sys_public_ip4)"
+  ui_note "This IRAN server listens; the foreign server will dial ${ST[my_ip]}."
+  echo
+  # [*] Tunnel port
+  local p
+  while :; do
+    p="$(_bh_ask_free_port '[*] Tunnel port' "${ST[tunnel_port]:-$(ports_alloc_public "${ST[name]}")}" "${ST[tunnel_port]:-}" 23)"
+    if _bh_reserved "$p" && [[ "$p" != "${ST[tunnel_port]:-}" ]]; then
+      ui_confirm "port $p is normally kept for x-ui / the system. Use it anyway?" n || continue
+    fi
+    break
+  done
+  ST[tunnel_port]="$p"
+
+  # [*] Transport (+ TLS certificate for wss/wssmux)
+  _bh_ask_transport
+  local t="${ST[transport]}"
+  if _bh_is_tls "$t"; then
+    local d; d="$(ui_ask '[-] TLS certificate domain (blank = self-signed, - = clear)' "${ST[domain]:-}")"
+    [[ "$d" == - ]] && d=''
+    ST[domain]="$d"
+  fi
+
+  # [-] Accept UDP (tcp only)
+  if [[ "$t" == tcp ]]; then
+    ST[accept_udp]="$(ui_ask_bool '[-] Accept UDP connections over TCP transport' "${ST[accept_udp]:-false}")"
+  else ST[accept_udp]=false; fi
+  # [-] Channel size
+  ST[channel_size]="$(ui_ask_int '[-] Channel size' "${ST[channel_size]:-2048}" 64 8192)"
+  # [-] TCP_NODELAY (not for udp)
+  if [[ "$t" == udp ]]; then ST[nodelay]=false
+  else ST[nodelay]="$(ui_ask_bool '[-] Enable TCP_NODELAY' "${ST[nodelay]:-true}")"; fi
+  # [-] Heartbeat
+  ST[heartbeat]="$(ui_ask_int '[-] Heartbeat (in seconds)' "${ST[heartbeat]:-40}" 1 240)"
+  # [-] Security token (mili default: random, never Musixal's 'your_token')
+  ST[token]="$(_bh_ask_token "${ST[token]:-$(sys_rand_token 24)}")"
+  # [-] Mux concurrency + version (mux transports)
+  if _bh_is_mux "$t"; then
+    ST[mux_con]="$(ui_ask_int '[-] Mux concurrency' "${ST[mux_con]:-8}" 1 1000)"
+    ST[mux_version]="$(ui_ask_int '[-] Mux version (1 or 2)' "${ST[mux_version]:-2}" 1 2)"
+  else
+    ST[mux_con]="${ST[mux_con]:-8}"; ST[mux_version]="${ST[mux_version]:-2}"
+  fi
+  # [-] Sniffer + web port
+  ST[sniffer]="$(ui_ask_bool '[-] Enable sniffer' "${ST[sniffer]:-false}")"
+  ST[web_port]="$(_bh_ask_free_port '[-] Web port (0 = disabled)' "${ST[web_port]:-0}" "${ST[web_port]:-}" 0 zero)"
+  # [-] Proxy protocol (not ws/udp)
+  if [[ "$t" == ws || "$t" == udp ]]; then ST[proxy_protocol]=false
+  else ST[proxy_protocol]="$(ui_ask_bool '[-] Enable proxy protocol' "${ST[proxy_protocol]:-false}")"; fi
+  ST[keepalive]="${ST[keepalive]:-75}"
+
+  # [*] usage (mili) -> SOCKS ports, or Musixal's ports list
+  _bh_ask_usage
+  if [[ "${ST[mode]}" == socks ]]; then
+    while :; do
+      p="$(_bh_ask_free_port '[*] SOCKS5 port on THIS server (3x-ui outbound → 127.0.0.1:port)' \
+            "${ST[iran_socks]:-$(ports_alloc_socks "${ST[name]}")}" "${ST[iran_socks]:-}" 1)"
+      if [[ "$p" == "${ST[tunnel_port]}" || "$p" == "${ST[web_port]}" ]]; then ui_err "must differ from the tunnel/web port"; continue; fi
+      break
+    done
+    ST[iran_socks]="$p"
+    ST[foreign_socks]="$(ui_ask_port '[*] SOCKS5 port on the FOREIGN server' "${ST[foreign_socks]:-$(_bh_socks_default "${ST[tunnel_port]}")}")"
+    ST[fwd]=''
+  else
+    _bh_ports_help
+    local v
+    while :; do
+      v="$(ui_ask '[*] Enter your ports (comma separated)' "${ST[fwd]:-}")"; v="${v// /}"
+      _bh_fwd_check "$v" && break
+    done
+    ST[fwd]="$v"
+  fi
+  return 0
+}
+
+_bh_wizard_foreign() {
+  local v
+  # [*] IRAN server IP
+  while :; do
+    v="$(ui_ask '[*] IRAN server IP address [IPv4/IPv6]' "${ST[iran_ip]:-}")"; v="${v// /}"; v="${v#[}"; v="${v%]}"
+    if sys_is_ip4 "$v" || [[ "$v" == *:* && "$v" =~ ^[0-9A-Fa-f:.]+$ ]] || { [[ "$v" == *.* ]] && sys_is_host "$v"; }; then break; fi
+    ui_err "enter the Iran server's IP (or domain)"
+  done
+  ST[iran_ip]="$v"
+  # [*] Tunnel port
+  ST[tunnel_port]="$(ui_ask_int '[*] Tunnel port (as shown on Iran)' "${ST[tunnel_port]:-}" 23 65535)"
+  # [*] Transport
+  _bh_ask_transport
+  local t="${ST[transport]}"
+  # [-] Edge IP (websocket transports, CDN)
+  if _bh_is_ws "$t"; then
+    v="$(ui_ask '[-] Edge IP/Domain (optional, blank = none, - = clear)' "${ST[edge_ip]:-}")"
+    [[ "$v" == - ]] && v=''
+    ST[edge_ip]="$v"
+  else ST[edge_ip]=''; fi
+  # [-] Security token (must match Iran)
+  ST[token]="$(_bh_ask_token "${ST[token]:-}")"
+  # [-] TCP_NODELAY
+  if [[ "$t" == udp ]]; then ST[nodelay]=false
+  else ST[nodelay]="$(ui_ask_bool '[-] Enable TCP_NODELAY' "${ST[nodelay]:-true}")"; fi
+  # [-] Connection pool
+  ST[conn_pool]="$(ui_ask_int '[-] Connection pool' "${ST[conn_pool]:-8}" 1 1024)"
+  # [-] Mux version
+  if _bh_is_mux "$t"; then
+    ST[mux_version]="$(ui_ask_int '[-] Mux version (1 or 2)' "${ST[mux_version]:-2}" 1 2)"
+  else ST[mux_version]="${ST[mux_version]:-2}"; fi
+  # [-] Sniffer + web port
+  ST[sniffer]="$(ui_ask_bool '[-] Enable sniffer' "${ST[sniffer]:-false}")"
+  ST[web_port]="$(_bh_ask_free_port '[-] Web port (0 = disabled)' "${ST[web_port]:-0}" "${ST[web_port]:-}" 0 zero)"
+  ST[keepalive]="${ST[keepalive]:-75}"
+
+  # [*] usage (mili): the SOCKS helper lives here, on the foreign side
+  _bh_ask_usage
+  if [[ "${ST[mode]}" == socks ]]; then
+    ST[foreign_socks]="$(_bh_ask_free_port '[*] SOCKS5 port (must match the Iran side)' \
+          "${ST[foreign_socks]:-$(_bh_socks_default "${ST[tunnel_port]}")}" "${ST[foreign_socks]:-}" 1)"
+  fi
+  return 0
+}
+
+t_backhaul_summary() {
+  local t="${ST[transport]}" x=''
+  _bh_is_mux "$t" && x=" · mux ${ST[mux_con]:-8} v${ST[mux_version]}"
+  if [[ "${ST[role]}" == iran ]]; then
+    ui_kv "Role" "Iran · server (listens)"
+    ui_kv "Tunnel" ":${ST[tunnel_port]} · $t$x$(_bh_is_tls "$t" && echo " · TLS ${ST[domain]:-self-signed}")"
+    ui_kv "Security token" "${ST[token]}"
+    ui_kv "Tuning" "nodelay ${ST[nodelay]} · heartbeat ${ST[heartbeat]}s · channel ${ST[channel_size]}"
+    ui_kv "Options" "accept_udp ${ST[accept_udp]} · proxy_protocol ${ST[proxy_protocol]} · sniffer ${ST[sniffer]} · web ${ST[web_port]}"
+  else
+    ui_kv "Role" "Foreign · client (dials Iran)"
+    ui_kv "Dials" "$(_bh_hostport "${ST[iran_ip]}" "${ST[tunnel_port]}") · $t$x"
+    [[ -n "${ST[edge_ip]:-}" ]] && ui_kv "Edge" "${ST[edge_ip]}"
+    ui_kv "Security token" "${ST[token]}"
+    ui_kv "Tuning" "nodelay ${ST[nodelay]} · pool ${ST[conn_pool]} · sniffer ${ST[sniffer]} · web ${ST[web_port]}"
+  fi
+  if [[ "${ST[mode]}" == socks ]]; then
+    if [[ "${ST[role]}" == iran ]]; then ui_kv "Usage" "SOCKS · 3x-ui → 127.0.0.1:${ST[iran_socks]} → foreign :${ST[foreign_socks]}"
+    else ui_kv "Usage" "SOCKS · exit SOCKS5 on 127.0.0.1:${ST[foreign_socks]}"; fi
+  else
+    ui_kv "Usage" "port forward${ST[fwd]:+ · ${ST[fwd]}}"
+  fi
+  return 0
+}
+
+# ============================================================================
+# render / firewall / ports
+# ============================================================================
+_bh_tls_ensure() {  # <name>  (self-signed only when no real cert is used)
+  local crt key; read -r crt key <<<"$(_bh_tls_paths "$1")"
+  [[ "$crt" == "$MILI_ETC/pki/$1/"* && ! -f "$crt" ]] || return 0
+  mkdir -p "$MILI_ETC/pki/$1"
+  openssl req -x509 -newkey rsa:2048 -keyout "$key" -out "$crt" -days 3650 -nodes \
+    -subj "/CN=${ST[domain]:-mili.local}" >/dev/null 2>&1 || ui_warn "could not create a self-signed certificate (openssl)"
+  chmod 600 "$key" 2>/dev/null || true
+}
+
+t_backhaul_render() {  # <name>
+  st_load "$1"; local name="$1" f="$MILI_BH_ETC/$1.toml"
+  if [[ "${MILI_DRYRUN:-0}" == 1 ]]; then ui_info "[dry] would write $f:"; _bh_toml "$name"; return 0; fi
+  mkdir -p "$MILI_BH_ETC" "$MILI_LOGDIR" 2>/dev/null || true
+  if [[ "${ST[role]}" == iran ]] && _bh_is_tls "${ST[transport]}"; then _bh_tls_ensure "$name"; fi
+  ( umask 077; _bh_toml "$name" >"$f" )
+}
+
+# protocols the Iran-side forward listeners use
+_bh_fwd_protos() {
+  if [[ "${ST[transport]}" == udp ]]; then echo udp
+  elif [[ "${ST[accept_udp]:-false}" == true ]]; then echo "tcp udp"
+  else echo tcp; fi
+}
+
 t_backhaul_fw_apply() {  # <name>
-  st_load "$1"; local name="$1"
+  st_load "$1"; local name="$1" it bind lp pr
   if [[ "${ST[role]}" == iran ]]; then
     fw_allow "$name" tcp "${ST[tunnel_port]}"; fw_ufw_mirror "$name" tcp "${ST[tunnel_port]}"
+    if [[ "${ST[transport]}" == udp ]]; then
+      fw_allow "$name" udp "${ST[tunnel_port]}"; fw_ufw_mirror "$name" udp "${ST[tunnel_port]}"
+    fi
+    if [[ "${ST[mode]}" == forward ]]; then
+      while read -r it; do
+        read -r bind lp <<<"$(_bh_fwd_local "$it")"
+        [[ "$bind" == 127.* ]] && continue
+        for pr in $(_bh_fwd_protos); do
+          fw_allow "$name" "$pr" "$lp"; fw_ufw_mirror "$name" "$pr" "${lp//-/:}"
+        done
+      done < <(_bh_fwd_items "${ST[fwd]:-}")
+    fi
+  fi
+  if [[ "${ST[web_port]:-0}" != 0 ]]; then
+    fw_allow "$name" tcp "${ST[web_port]}"; fw_ufw_mirror "$name" tcp "${ST[web_port]}"
+  fi
+  return 0
+}
+
+_bh_claim() {  # <name>
+  local name="$1" it bind lp a b p pr=tcp
+  ports_release "$name"
+  if [[ "${ST[role]}" == iran ]]; then
+    [[ "${ST[transport]}" == udp ]] && pr=both
+    ports_claim "$name" "$pr" "${ST[tunnel_port]}" 0.0.0.0
     if [[ "${ST[mode]}" == socks ]]; then
-      fw_loopback_guard "$name" tcp "${ST[iran_socks]}"
+      ports_claim "$name" tcp "${ST[iran_socks]}" 127.0.0.1
     else
-      local item lport proto=tcp
-      IFS=',' read -ra items <<<"${ST[fwd]}"
-      for item in "${items[@]}"; do
-        [[ -z "$item" ]] && continue
-        lport="${item%%=*}"
-        fw_allow "$name" tcp "$lport"; fw_ufw_mirror "$name" tcp "$lport"
-      done
+      while read -r it; do
+        read -r bind lp <<<"$(_bh_fwd_local "$it")"
+        a="${lp%%-*}"; b="${lp##*-}"
+        if (( b - a > 100 )); then ui_warn "range $lp: not registered port-by-port (too wide)"; continue; fi
+        for (( p = a; p <= b; p++ )); do ports_claim "$name" tcp "$p" "$bind"; done
+      done < <(_bh_fwd_items "${ST[fwd]:-}")
     fi
+  elif [[ "${ST[mode]}" == socks ]]; then
+    ports_claim "$name" tcp "${ST[foreign_socks]}" 127.0.0.1
   fi
-}
-
-t_backhaul_up() {  # <name>
-  st_load "$1"; local name="$1"
-  require_root; cores_ensure backhaul
-  t_backhaul_render "$name"
-  t_backhaul_fw_apply "$name"
-  svc_up "mili-backhaul@$name.service"
-  if [[ "${ST[role]}" == iran ]]; then
-    ports_claim "$name" tcp "${ST[tunnel_port]}" "0.0.0.0"
-    [[ "${ST[mode]}" == socks ]] && ports_claim "$name" tcp "${ST[iran_socks]}" "127.0.0.1"
-  else
-    if [[ "${ST[mode]}" == socks ]]; then
-      cores_ensure gost
-      socks_render "$name" "127.0.0.1" "${ST[foreign_socks]}" "${ST[socks_user]}" "${ST[socks_pass]}"
-      svc_up "mili-socks@$name.service"
-      ports_claim "$name" tcp "${ST[foreign_socks]}" "127.0.0.1"
-    fi
-  fi
-}
-
-t_backhaul_down() {  # <name>
-  st_load "$1"; local name="$1"
-  svc_down "mili-backhaul@$name.service" 2>/dev/null || true
-  svc_down "mili-socks@$name.service" 2>/dev/null || true
-  fw_remove "$name"
-}
-
-t_backhaul_purge() { run rm -f "$MILI_BH_ETC/$1.toml" 2>/dev/null || true; }
-
-t_backhaul_health() {  # <name>
-  st_load "$1"
-  if [[ "${ST[role]}" == iran ]]; then
-    ss -Hlnt 2>/dev/null | awk '{print $4}' | grep -qE ":${ST[tunnel_port]}\$"
-  else
-    svc_active "mili-backhaul@$1.service"
-  fi
+  if [[ "${ST[web_port]:-0}" != 0 ]]; then ports_claim "$name" tcp "${ST[web_port]}" 0.0.0.0; fi
+  return 0
 }
 
 t_backhaul_ports() {
@@ -2005,78 +2416,200 @@ t_backhaul_ports() {
   else
     [[ "${ST[mode]}" == socks ]] && echo "tcp:${ST[foreign_socks]}:127.0.0.1"
   fi
+  return 0
+}
+
+# ============================================================================
+# lifecycle
+# ============================================================================
+_bh_start_socks() {  # <name> (foreign, socks mode): loopback gost exit
+  cores_ensure gost || { ui_err "gost core install failed"; return 1; }
+  socks_render "$1" 127.0.0.1 "${ST[foreign_socks]}" "${ST[socks_user]:-}" "${ST[socks_pass]:-}"
+  svc_enable "mili-socks@$1.service"
+  run systemctl restart "mili-socks@$1.service"
+}
+
+t_backhaul_up() {  # <name>
+  st_load "$1"; local name="$1"
+  require_root
+  cores_ensure backhaul || { ui_err "backhaul core install failed"; return 1; }
+  t_backhaul_render "$name"
+  t_backhaul_fw_apply "$name"
+  _bh_claim "$name"
+  svc_up "mili-backhaul@$name.service" || return 1
+  if [[ "${ST[role]}" == foreign && "${ST[mode]}" == socks ]]; then _bh_start_socks "$name" || return 1; fi
+  return 0
+}
+
+# create / Edit: (re)write config, RESTART (a plain start is a no-op on a running unit), verify
+t_backhaul_provision() {  # <name>
+  st_load "$1"; local name="$1" u="mili-backhaul@$1.service"
+  require_root
+  cores_ensure backhaul || { ui_err "backhaul core install failed"; return 1; }
+  t_backhaul_render "$name" || return 1
+  fw_remove "$name"; t_backhaul_fw_apply "$name"
+  _bh_claim "$name"
+  svc_enable "$u"
+  run systemctl restart "$u" || { ui_err "could not start $u"; svc_logs "$u" 20; return 1; }
+  if [[ "${ST[role]}" == foreign && "${ST[mode]}" == socks ]]; then
+    _bh_start_socks "$name" || return 1
+  else
+    svc_down "mili-socks@$name.service" >/dev/null 2>&1 || true   # mode changed away from socks
+  fi
+  _bh_verify "$name"
+}
+
+# live checks
+_bh_listening() { ports_live 2>/dev/null | grep -qx "$1"; }      # tcp or udp
+_bh_connected() {  # foreign: an established TCP session to Iran's tunnel port
+  local ip="${ST[iran_ip]#[}"; ip="${ip%]}"
+  [[ -n "${ST[edge_ip]:-}" ]] && ip=''          # via a CDN edge the peer IP differs
+  ss -Htn state established 2>/dev/null | awk -v p="${ST[tunnel_port]}" -v ip="$ip" '
+    { n = split($4, a, ":"); if (a[n] == p && (ip == "" || index($4, ip))) { f = 1; exit } } END { exit !f }'
+}
+_bh_peer_up() {  # iran: the foreign side is connected (Iran opens its ports only then)
+  if [[ "${ST[mode]}" == socks ]]; then ports_listening "${ST[iran_socks]}"; return; fi
+  local it bind lp
+  it="$(_bh_fwd_items "${ST[fwd]:-}" | head -n1)"; [[ -z "$it" ]] && return 1
+  read -r bind lp <<<"$(_bh_fwd_local "$it")"
+  _bh_listening "${lp%%-*}"
+}
+
+_bh_verify() {  # <name>
+  local name="$1" u="mili-backhaul@$1.service" i
+  [[ "${MILI_DRYRUN:-0}" == 1 ]] && { ui_info "[dry] skipping live checks"; return 0; }
+  for (( i = 0; i < 4; i++ )); do sleep 1; svc_active "$u" || break; done
+  if ! svc_active "$u"; then
+    ui_err "backhaul did not stay up:"; journalctl -u "$u" -n 15 --no-pager 2>/dev/null; return 1
+  fi
+  if [[ "${ST[role]}" == iran ]]; then
+    for (( i = 0; i < 6; i++ )); do _bh_listening "${ST[tunnel_port]}" && break; sleep 1; done
+    if ! _bh_listening "${ST[tunnel_port]}"; then
+      ui_err "backhaul is running but not listening on :${ST[tunnel_port]}"; journalctl -u "$u" -n 15 --no-pager 2>/dev/null; return 1
+    fi
+    ui_ok "listening on :${ST[tunnel_port]} (${ST[transport]})"
+    if _bh_peer_up; then ui_ok "foreign server connected"
+    else ui_note "waiting for the foreign server - the SOCKS/forward ports open once it connects"; fi
+  else
+    if [[ "${ST[mode]}" == socks ]]; then
+      for (( i = 0; i < 5; i++ )); do ports_listening "${ST[foreign_socks]}" && break; sleep 1; done
+      if ports_listening "${ST[foreign_socks]}"; then ui_ok "exit SOCKS5 ready on 127.0.0.1:${ST[foreign_socks]}"
+      else ui_err "exit SOCKS5 (gost) is not listening on 127.0.0.1:${ST[foreign_socks]}"; return 1; fi
+    fi
+    if [[ "${ST[transport]}" == udp ]]; then
+      ui_note "udp transport: check the Iran side shows 'foreign server connected'."
+      return 0
+    fi
+    for (( i = 0; i < 12; i++ )); do _bh_connected && break; sleep 1; done
+    if _bh_connected; then ui_ok "connected to Iran $(_bh_hostport "${ST[iran_ip]}" "${ST[tunnel_port]}")"
+    else
+      ui_warn "not connected to Iran yet. Check: the Iran tunnel is up, and IP / port / transport / token match;"
+      ui_warn "the Iran provider firewall must allow TCP ${ST[tunnel_port]}."
+      journalctl -u "$u" -n 6 --no-pager 2>/dev/null | grep -iE 'token|refused|timeout|error' | tail -n 3
+    fi
+  fi
+  return 0
+}
+
+t_backhaul_down() {  # <name>
+  svc_down "mili-backhaul@$1.service" 2>/dev/null || true
+  svc_down "mili-socks@$1.service" 2>/dev/null || true
+  fw_remove "$1"
+}
+
+t_backhaul_purge() {
+  run rm -f "$MILI_BH_ETC/$1.toml" 2>/dev/null || true
+  run rm -rf "$MILI_ETC/pki/$1" 2>/dev/null || true
+}
+
+# cheap (menu): Iran = tunnel port bound; Foreign = service running
+t_backhaul_health() {  # <name>
+  st_load "$1"
+  if [[ "${ST[role]}" == iran ]]; then _bh_listening "${ST[tunnel_port]}"
+  else svc_active "mili-backhaul@$1.service"; fi
+}
+# deeper (watchdog): Foreign must actually hold a session to Iran
+t_backhaul_probe() {  # <name>
+  st_load "$1"
+  if [[ "${ST[role]}" == iran ]]; then _bh_listening "${ST[tunnel_port]}"; return; fi
+  svc_active "mili-backhaul@$1.service" || return 1
+  [[ "${ST[transport]}" == udp ]] && return 0
+  _bh_connected
 }
 
 t_backhaul_info() {
   st_load "$1"
-  ui_kv "role/mode" "${ST[role]} / ${ST[mode]}"
-  ui_kv "transport" "${ST[transport]}"
+  local t="${ST[transport]}"
+  ui_kv "transport" "$t$(_bh_is_mux "$t" && echo " · mux v${ST[mux_version]:-1}")"
   if [[ "${ST[role]}" == iran ]]; then
-    ui_kv "listen" "0.0.0.0:${ST[tunnel_port]}"
-    [[ "${ST[mode]}" == socks ]] && { echo; xui_outbound_box "127.0.0.1" "${ST[iran_socks]}" "${ST[socks_user]}" "${ST[socks_pass]}"; }
-    [[ "${ST[mode]}" == forward ]] && ui_kv "ports" "${ST[fwd]}"
+    ui_kv "role" "Iran · server, listens :${ST[tunnel_port]}"
+    ui_kv "foreign" "$(_bh_peer_up && echo connected || echo 'waiting for the foreign server')"
+    if [[ "${ST[mode]}" == socks ]]; then echo; xui_outbound_box "127.0.0.1" "${ST[iran_socks]}" "${ST[socks_user]:-}" "${ST[socks_pass]:-}"
+    else ui_kv "ports" "${ST[fwd]}"; fi
   else
-    ui_kv "dials" "${ST[iran_ip]}:${ST[tunnel_port]}"
-    [[ "${ST[mode]}" == socks ]] && ui_kv "egress socks" "127.0.0.1:${ST[foreign_socks]}"
+    ui_kv "role" "Foreign · client → $(_bh_hostport "${ST[iran_ip]}" "${ST[tunnel_port]}")"
+    [[ "$t" != udp ]] && ui_kv "link" "$(_bh_connected && echo 'connected to Iran' || echo 'not connected')"
+    [[ "${ST[mode]}" == socks ]] && ui_kv "exit SOCKS5" "127.0.0.1:${ST[foreign_socks]}"
   fi
+  return 0
 }
 
 t_backhaul_xui() {
   st_load "$1"; local name="$1"
   if [[ "${ST[mode]}" == socks && "${ST[role]}" == iran ]]; then
-    xui_help_socks "$name" "127.0.0.1" "${ST[iran_socks]}" "${ST[socks_user]}" "${ST[socks_pass]}"
+    xui_help_socks "$name" "127.0.0.1" "${ST[iran_socks]}" "${ST[socks_user]:-}" "${ST[socks_pass]:-}"
   elif [[ "${ST[mode]}" == socks ]]; then
-    ui_warn "SOCKS endpoint is on the IRAN server (127.0.0.1:${ST[iran_socks]}); run helper there."
+    ui_warn "the 3x-ui SOCKS outbound is on the IRAN server: Manage → its Backhaul tunnel → 3x-ui JSON helper."
   else
-    ui_head "Use '$name' with 3x-ui (port forward)"; ui_note "Foreign ports published on Iran: ${ST[fwd]}"
+    ui_head "Use '$name' with 3x-ui (port forward)"; ui_note "Iran ports → foreign: ${ST[fwd]}"
   fi
 }
 
 t_backhaul_test() {
   st_load "$1"
-  if [[ "${ST[mode]}" == socks && "${ST[role]}" == iran ]]; then
-    doctor_socks 127.0.0.1 "${ST[iran_socks]}" "${ST[socks_user]}" "${ST[socks_pass]}"
+  if [[ "${ST[role]}" == iran ]]; then
+    if t_backhaul_health "$1"; then ui_ok "listening on :${ST[tunnel_port]}"; else ui_err "not listening on :${ST[tunnel_port]}"; return 1; fi
+    if ! _bh_peer_up; then ui_warn "the foreign server is not connected"; return 1; fi
+    ui_ok "foreign server connected"
+    if [[ "${ST[mode]}" == socks ]]; then doctor_socks 127.0.0.1 "${ST[iran_socks]}" "${ST[socks_user]:-}" "${ST[socks_pass]:-}"; fi
   else
-    t_backhaul_health "$1" && ui_ok "backhaul up" || ui_err "backhaul down"
+    if t_backhaul_probe "$1"; then ui_ok "connected to Iran"; else ui_err "not connected to Iran"; return 1; fi
   fi
 }
 
-t_backhaul_pair_export() {
+# what to type on the other server (Backhaul has no token blob: it's 4 values)
+t_backhaul_handoff() {  # <name>
   st_load "$1"
-  local peerrole; [[ "${ST[role]}" == iran ]] && peerrole=foreign || peerrole=iran
-  cat <<EOF
-type=backhaul
-name=${ST[name]}
-role=$peerrole
-mode=${ST[mode]}
-transport=${ST[transport]}
-tunnel_port=${ST[tunnel_port]}
-token=${ST[token]}
-iran_ip=${ST[my_ip]:-${ST[iran_ip]:-}}
-iran_socks=${ST[iran_socks]:-}
-foreign_socks=${ST[foreign_socks]:-}
-socks_user=${ST[socks_user]:-}
-socks_pass=${ST[socks_pass]:-}
-fwd=${ST[fwd]:-}
-nodelay=${ST[nodelay]}
-keepalive=${ST[keepalive]}
-heartbeat=${ST[heartbeat]:-40}
-mux_con=${ST[mux_con]:-8}
-conn_pool=${ST[conn_pool]:-8}
-domain=${ST[domain]:-}
-EOF
-}
-
-t_backhaul_pair_import() {
-  local p="$1" name role k
-  name="$(pair_field "$p" name)"; role="$(pair_field "$p" role)"
-  ST=(); ST[name]="$name"; ST[type]=backhaul; ST[role]="$role"
-  for k in mode transport tunnel_port token iran_ip iran_socks foreign_socks socks_user socks_pass fwd nodelay keepalive heartbeat mux_con conn_pool domain; do
-    ST[$k]="$(pair_field "$p" "$k")"
-  done
-  [[ "$role" == iran ]] && ST[my_ip]="$(sys_public_ip4)"
-  st_save
-  t_backhaul_up "$name"; st_set state up; st_save
+  if [[ "${ST[role]}" == iran ]]; then
+    ui_head "Backhaul '$1' - type these on the FOREIGN server"
+    ui_note "There: mili → New tunnel → Backhaul → Foreign"
+    ui_warn "the token is a secret - share it only with your foreign server"
+    echo
+    ui_kv "IRAN server IP" "${ST[my_ip]:-$(sys_public_ip4)}"
+    ui_kv "Tunnel port" "${ST[tunnel_port]}"
+    ui_kv "Transport" "${ST[transport]}"
+    ui_kv "Security token" "${ST[token]}"
+    _bh_is_mux "${ST[transport]}" && ui_kv "Mux version" "${ST[mux_version]}"
+    if [[ "${ST[mode]}" == socks ]]; then
+      ui_kv "Usage" "SOCKS outbound"
+      ui_kv "SOCKS5 port" "${ST[foreign_socks]}"
+    else
+      ui_kv "Usage" "Port forward"
+    fi
+    echo; ui_note "Every other question: press Enter."
+    ui_note "If this server's provider has a firewall panel, allow $([[ "${ST[transport]}" == udp ]] && echo 'TCP+UDP' || echo TCP) ${ST[tunnel_port]}."
+    if [[ "${ST[mode]}" == socks ]]; then echo; xui_outbound_box "127.0.0.1" "${ST[iran_socks]}" "${ST[socks_user]:-}" "${ST[socks_pass]:-}"; fi
+  else
+    ui_head "Backhaul '$1' - foreign side"
+    if [[ "${ST[transport]}" != udp ]]; then
+      if _bh_connected; then ui_ok "connected to Iran $(_bh_hostport "${ST[iran_ip]}" "${ST[tunnel_port]}")"
+      else ui_warn "not connected to Iran yet (see the hints above)"; fi
+    fi
+    if [[ "${ST[mode]}" == socks ]]; then
+      ui_note "The 3x-ui SOCKS outbound lives on the IRAN server: Manage → its Backhaul tunnel → 3x-ui JSON helper."
+    fi
+  fi
+  return 0
 }
 
 # ===== tunnels/frp.sh =====
@@ -3263,43 +3796,6 @@ _hed_tunnels() {  # [role] [exclude-name]
   done
 }
 
-_hed_listening() { ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE ":$1\$"; }
-
-# who listens on tcp <port>? prints process name ('?' if hidden); rc 1 = free
-_hed_port_listener() {
-  local line who
-  line="$(ss -Hltnp 2>/dev/null | awk -v p="$1" '{n = split($4, a, ":"); if (a[n] == p) { print; exit }}')"
-  [[ -z "$line" ]] && return 1
-  who="$(printf '%s' "$line" | grep -oE 'users:\(\("[^"]+' | head -n1 | sed 's/^users:(("//')"
-  printf '%s' "${who:-?}"
-}
-
-# is <port> unavailable for a hedioum mimic? prints the reason. hedioum's own
-# listeners don't count (re-setup); MILI_RESERVED is NOT used (443 is a real mimic port)
-_hed_port_busy() {  # <port> [exclude-tunnel]
-  local port="$1" excl="${2:-}" who
-  if who="$(_hed_port_listener "$port")" && [[ "$who" != hedioum* ]]; then
-    printf '%s' "$who"; return 0
-  fi
-  if ports_xui 2>/dev/null | grep -qx "$port"; then printf 'x-ui'; return 0; fi
-  if [[ -f "$MILI_PORTSDB" ]] && awk -F'|' -v pt="$port" -v ex="$excl" '$3==pt && $1!=ex {f=1} END {exit !f}' "$MILI_PORTSDB"; then
-    printf 'another mili tunnel'; return 0
-  fi
-  return 1
-}
-
-# first free public port not in <taken...>
-_hed_free_port() {
-  local p t skip
-  for (( p = MILI_PUB_LO; p <= MILI_PUB_HI; p++ )); do
-    skip=0; for t in "$@"; do [[ "$t" == "$p" ]] && { skip=1; break; }; done
-    (( skip )) && continue
-    ports_in_use "$p" && continue
-    printf '%s' "$p"; return 0
-  done
-  return 1
-}
-
 _hed_sshd_port() { ports_sshd 2>/dev/null | head -n1; }
 
 # the operator's SSH session is proxied by hedioum's SSH mimic (sshd sees 127.0.0.1)
@@ -3401,23 +3897,6 @@ t_hedioum_wizard() {  # <role> [level]
   if [[ "$1" == foreign ]]; then _hed_wizard_foreign; else _hed_wizard_iran; fi
 }
 
-_hed_ask_port() {  # <prompt> <default>
-  local v
-  while :; do
-    v="$(ui_ask "$1" "$2")"
-    [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )) && { printf '%s' "$v"; return 0; }
-    ui_err "port must be 1-65535" >&2
-  done
-}
-_hed_ask_int() {  # <prompt> <default> <min>
-  local v
-  while :; do
-    v="$(ui_ask "$1" "$2")"
-    [[ "$v" =~ ^[0-9]+$ ]] && (( v >= $3 )) && { printf '%s' "$v"; return 0; }
-    ui_err "enter a whole number >= $3" >&2
-  done
-}
-
 _hed_wizard_foreign() {
   local crole other
   crole="$(_hed_cfg_role)"
@@ -3494,13 +3973,13 @@ _hed_wizard_foreign() {
   if [[ ",${ST[mimics]}," == *,ssh,* ]]; then
     sshd="$(_hed_sshd_port)"
     while :; do
-      lp="$(_hed_ask_port 'SSH mimic public port' "${ST[ssh_port]:-22}")"
+      lp="$(ui_ask_port 'SSH mimic public port' "${ST[ssh_port]:-22}")"
       if [[ "$lp" == "$sshd" ]]; then
         if ui_confirm "Move OpenSSH off port $lp to free it for the SSH mimic?" y; then
           while :; do
-            dp="$(_hed_ask_port 'Decoy sshd port (OpenSSH is moved here)' "${ST[decoy_port]:-2022}")"
+            dp="$(ui_ask_port 'Decoy sshd port (OpenSSH is moved here)' "${ST[decoy_port]:-2022}")"
             if [[ "$dp" == "$lp" ]]; then ui_err "decoy port must differ from $lp"; continue; fi
-            if who="$(_hed_port_busy "$dp" "${ST[name]}")"; then ui_err "port $dp is busy ($who)"; continue; fi
+            if who="$(ports_busy_reason "$dp" "${ST[name]}" hedioum)"; then ui_err "port $dp is busy ($who)"; continue; fi
             break
           done
           ST[move_ssh]=yes; ST[ssh_moved]=yes; ST[sshd_orig_port]="$lp"; ST[decoy_port]="$dp"
@@ -3510,7 +3989,7 @@ _hed_wizard_foreign() {
         ui_err "port $lp is OpenSSH's — pick another SSH mimic port (or move OpenSSH)."
         continue
       fi
-      if who="$(_hed_port_busy "$lp" "${ST[name]}")"; then
+      if who="$(ports_busy_reason "$lp" "${ST[name]}" hedioum)"; then
         ui_err "port $lp is busy ($who)."; continue
       fi
       # OpenSSH stays put: the mimic's decoy backend IS the real sshd, so probes see real OpenSSH
@@ -3531,11 +4010,11 @@ _hed_wizard_foreign() {
     while :; do
       who=''
       if [[ " ${taken[*]} " == *" $p "* ]]; then who="used by another mimic"
-      else who="$(_hed_port_busy "$p" "${ST[name]}")" || who=''; fi
+      else who="$(ports_busy_reason "$p" "${ST[name]}" hedioum)" || who=''; fi
       [[ -z "$who" ]] && break
-      alt="$(_hed_free_port "${taken[@]}")"
+      alt="$(ports_free_public "${taken[@]}")"
       ui_warn "$m mimic port $p is busy ($who)."
-      p="$(_hed_ask_port "Port for the $m mimic" "$alt")"
+      p="$(ui_ask_port "Port for the $m mimic" "$alt")"
     done
     taken+=("$p")
     if [[ "$p" == "$def" ]]; then unset "ST[$k]"; else ST[$k]="$p"; fi
@@ -3654,18 +4133,18 @@ _hed_wizard_iran() {
   # 3) local SOCKS5 port (the 3x-ui outbound target)
   local p who
   while :; do
-    p="$(_hed_ask_port 'Local SOCKS5 port (for the 3x-ui outbound)' "${ST[socks_port]:-$(ports_alloc_socks "${ST[name]}")}")"
-    if [[ "$p" != "${ST[socks_port]:-}" ]] && who="$(_hed_port_listener "$p")"; then ui_err "port $p is busy ($who)"; continue; fi
-    if who="$(_hed_port_busy "$p" "${ST[name]}")"; then ui_err "port $p is busy ($who)"; continue; fi
+    p="$(ui_ask_port 'Local SOCKS5 port (for the 3x-ui outbound)' "${ST[socks_port]:-$(ports_alloc_socks "${ST[name]}")}")"
+    if [[ "$p" != "${ST[socks_port]:-}" ]] && who="$(ports_who "$p")"; then ui_err "port $p is busy ($who)"; continue; fi
+    if who="$(ports_busy_reason "$p" "${ST[name]}" hedioum)"; then ui_err "port $p is busy ($who)"; continue; fi
     break
   done
   ST[socks_port]="$p"
 
   # 4) connection pool (hedioum defaults)
-  ST[min]="$(_hed_ask_int 'Min physical connections (warm-up pool)' "${ST[min]:-10}" 1)"
-  ST[max]="$(_hed_ask_int 'Max physical connections (scale limit)' "${ST[max]:-20}" "${ST[min]}")"
-  ST[bw]="$(_hed_ask_int 'Bandwidth limit per connection (Mbps)' "${ST[bw]:-8}" 1)"
-  ST[jitter]="$(_hed_ask_int 'Bandwidth jitter for DPI evasion (Mbps)' "${ST[jitter]:-2}" 0)"
+  ST[min]="$(ui_ask_int 'Min physical connections (warm-up pool)' "${ST[min]:-10}" 1)"
+  ST[max]="$(ui_ask_int 'Max physical connections (scale limit)' "${ST[max]:-20}" "${ST[min]}")"
+  ST[bw]="$(ui_ask_int 'Bandwidth limit per connection (Mbps)' "${ST[bw]:-8}" 1)"
+  ST[jitter]="$(ui_ask_int 'Bandwidth jitter for DPI evasion (Mbps)' "${ST[jitter]:-2}" 0)"
 
   # 5) optional TUN interface
   if ui_confirm "Also expose this node as a TUN network interface? (advanced; SOCKS stays on)" "$([[ "${ST[tun]:-}" == yes ]] && echo y || echo n)"; then
@@ -3799,14 +4278,14 @@ _hed_verify_foreign() {
   while read -r m p; do
     [[ -z "$p" ]] && continue
     for (( i = 0; i < 6; i++ )); do
-      who="$(_hed_port_listener "$p")" && [[ "$who" == hedioum* || "$who" == '?' ]] && break
+      who="$(ports_who "$p")" && [[ "$who" == hedioum* || "$who" == '?' ]] && break
       who=''; sleep 1
     done
     if [[ -n "$who" ]]; then ui_ok "$m mimic listening on :$p"
-    else ui_err "$m mimic NOT listening on :$p$(w="$(_hed_port_listener "$p")" && echo " (held by $w)")"; bad=1; fi
+    else ui_err "$m mimic NOT listening on :$p$(w="$(ports_who "$p")" && echo " (held by $w)")"; bad=1; fi
   done < <(_hed_cfg_mimics)
   if [[ "${ST[ssh_moved]:-}" == yes ]]; then
-    if _hed_listening "${ST[decoy_port]:-2022}"; then ui_ok "OpenSSH on :${ST[decoy_port]:-2022}"
+    if ports_listening "${ST[decoy_port]:-2022}"; then ui_ok "OpenSSH on :${ST[decoy_port]:-2022}"
     else ui_warn "OpenSSH not seen on :${ST[decoy_port]:-2022} — check before closing this session!"; fi
   fi
   (( bad == 0 )) || ui_note "logs: journalctl -u $HED_UNIT -n 50"
@@ -3848,8 +4327,8 @@ _hed_provision_iran() {
   [[ "${MILI_DRYRUN:-0}" == 1 ]] && { ui_note "dry-run: verification skipped"; return 0; }
   run systemctl enable "$HED_UNIT" >/dev/null 2>&1 || true
   _hed_wait_active 8 || { ui_err "hedioum.service is not running — see: journalctl -u $HED_UNIT -n 30"; return 1; }
-  for (( i = 0; i < 10; i++ )); do _hed_listening "${ST[socks_port]}" && break; sleep 1; done
-  if ! _hed_listening "${ST[socks_port]}"; then
+  for (( i = 0; i < 10; i++ )); do ports_listening "${ST[socks_port]}" && break; sleep 1; done
+  if ! ports_listening "${ST[socks_port]}"; then
     ui_err "SOCKS 127.0.0.1:${ST[socks_port]} is not listening — see: journalctl -u $HED_UNIT -n 30"; return 1
   fi
   ui_ok "SOCKS5 listening on 127.0.0.1:${ST[socks_port]}"
@@ -3885,7 +4364,7 @@ t_hedioum_up() {  # <name>
   fw_loopback_guard "$name" tcp "${ST[socks_port]}"
   [[ "${MILI_DRYRUN:-0}" == 1 ]] && return 0
   _hed_wait_active 8 || return 1
-  for (( i = 0; i < 10; i++ )); do _hed_listening "${ST[socks_port]}" && return 0; sleep 1; done
+  for (( i = 0; i < 10; i++ )); do ports_listening "${ST[socks_port]}" && return 0; sleep 1; done
   ui_err "SOCKS 127.0.0.1:${ST[socks_port]} not listening"; return 1
 }
 
@@ -3946,10 +4425,10 @@ t_hedioum_health() {  # <name>
   st_load "$1"
   svc_active "$HED_UNIT" || return 1
   if [[ "${ST[role]}" == iran ]]; then
-    _hed_listening "${ST[socks_port]:-0}"
+    ports_listening "${ST[socks_port]:-0}"
   else
     local m p
-    while read -r m p; do [[ -n "$p" ]] && { _hed_listening "$p" || return 1; }; done < <(_hed_cfg_mimics 2>/dev/null)
+    while read -r m p; do [[ -n "$p" ]] && { ports_listening "$p" || return 1; }; done < <(_hed_cfg_mimics 2>/dev/null)
     return 0
   fi
 }
@@ -4009,7 +4488,7 @@ t_hedioum_test() {
     local m p
     while read -r m p; do
       [[ -z "$p" ]] && continue
-      if _hed_listening "$p"; then ui_ok "$m :$p listening"; else ui_err "$m :$p NOT listening"; fi
+      if ports_listening "$p"; then ui_ok "$m :$p listening"; else ui_err "$m :$p NOT listening"; fi
     done < <(_hed_cfg_mimics 2>/dev/null)
     [[ -n "$b" ]] && { run "$b" check-ip 2>&1 | sed 's/^/    /' || true; }
   fi
@@ -4039,16 +4518,19 @@ t_hedioum_handoff() {  # <name>
 
 # ===== tunnels/paqet.sh =====
 # shellcheck shell=bash
-# mili :: tunnels/paqet.sh - hanselime/paqet raw-packet tunnel.
-# server = FOREIGN (listens), client = IRAN (dials, exposes local SOCKS5).
-# Uses raw pcap packets with TCP-flag cycling + KCP. mili adds the required
-# raw NOTRACK + mangle RST-drop in ITS OWN chains (never iptables-persistent).
+# mili :: tunnels/paqet.sh - hanselime/paqet raw-packet tunnel (KCP over pcap).
 #
-# NOTE: paqet is alpha; the generated config keys follow the documented layout
-# and are confirmed against the installed binary at first run (verify-at-impl).
+# NATIVE flow (no mili pairing code): mili asks the same questions as the
+# ChownYourLife/paqet-tunnel deploy script, in the same order, every one with an
+# Enter default, and writes paqet's own YAML config.
+#   FOREIGN = server ("Kharej") - listens on a raw port      (set up first)
+#   IRAN    = client            - dials it with the values the foreign shows:
+#             foreign IP, port, encryption key  -> local SOCKS5 for 3x-ui
 #
-# roles: iran (client) | foreign (server)
-# config: /etc/mili/engines/paqet/<name>.conf
+# Firewall (paqet README / deploy script, server side): raw NOTRACK on the port
+# (in + out) and drop kernel RSTs from it - in mili's own chains, never
+# iptables-persistent. paqet binaries are static (no libpcap package needed).
+# config: /etc/mili/engines/paqet/<name>.yaml   run: paqet run -c <config>
 
 t_register paqet
 feature "tunnel.paqet" free
@@ -4060,115 +4542,416 @@ t_paqet_meta() {
   echo "title=paqet  (raw packet, anti-DPI)"
   echo "tier=free"
   echo "layer=socks"
-  echo "roles=iran foreign"
-  echo "primary=foreign"   # foreign = server (listener) generates; iran dials in
-  echo "twoway=no"
+  echo "roles=foreign iran"
+  echo "primary=foreign"
+  echo "pairing=native"
+  echo "handoff_label=Show values for the Iran server"
+  echo "first_hint=Set up the FOREIGN server first (it listens). Then on the IRAN server pick paqet → Iran and type the IP, port and key the foreign server shows."
   echo "cores=paqet"
-}
-
-_paqet_guard_port() {  # refuse kernel/x-ui/reserved ports for the raw listener
-  local port="$1"
-  local r
-  for r in 80 443 22 53; do [[ "$port" == "$r" ]] && return 1; done
-  ports_xui | grep -qx "$port" && return 1
-  return 0
-}
-
-t_paqet_wizard() {  # <role> <level>
-  local role="$1" level="$2"
-  # generator = foreign (server/listener); iran side is created by import
-  ST[my_ip]="$(sys_public_ip4)"
-  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This foreign server public IP (auto-detected)' "${ST[my_ip]}")"
-  ui_ok "this foreign server's public IP: ${ST[my_ip]}  (iran will dial it)"
-  ST[listen_port]="$(ui_ask 'paqet listen port (foreign, raw)' "${ST[listen_port]:-$(sys_rand_port 20000 29999)}")"
-  _paqet_guard_port "${ST[listen_port]}" || { ui_err "that port is reserved / used by x-ui; pick another"; return 1; }
-  [[ -z "${ST[secret]:-}" ]] && ST[secret]="$(sys_rand_hex 16)"
-
-  # auto network facts (client side needs iface / local ip / router mac)
-  ST[iface]="${ST[iface]:-$(sys_default_iface)}"
-  ST[local_ip]="${ST[local_ip]:-$(sys_local_ip4)}"
-  ST[router_mac]="${ST[router_mac]:-$(sys_gw_mac 2>/dev/null)}"
-
-  if [[ "$level" == advanced ]]; then
-    ST[local_flag]="$(ui_ask 'local TCP flag (e.g. PA/S/A)' "${ST[local_flag]:-PA}")"
-    ST[remote_flag]="$(ui_ask 'remote TCP flag' "${ST[remote_flag]:-PA}")"
-    echo; ui_info "KCP mode: normal fast fast2 fast3 manual"
-    ST[kcp]="$(ui_ask 'kcp mode' "${ST[kcp]:-fast2}")"
-    ST[conn]="$(ui_ask 'connection count' "${ST[conn]:-4}")"
-    ST[mtu]="$(ui_ask 'mtu' "${ST[mtu]:-1350}")"
-    ST[nocongestion]="$(ui_ask 'nocongestion true/false' "${ST[nocongestion]:-true}")"
-  else
-    ST[local_flag]="${ST[local_flag]:-PA}"; ST[remote_flag]="${ST[remote_flag]:-PA}"
-    ST[kcp]="${ST[kcp]:-fast2}"; ST[conn]="${ST[conn]:-4}"; ST[mtu]="${ST[mtu]:-1350}"; ST[nocongestion]="${ST[nocongestion]:-true}"
-  fi
-  ST[mode]=socks
-  return 0
-}
-
-t_paqet_render() {  # <name>
-  st_load "$1"; local name="$1" f; f="$MILI_PQ_ETC/$name.conf"
-  run mkdir -p "$MILI_PQ_ETC"
-  [[ "${MILI_DRYRUN:-0}" == 1 ]] && { ui_info "[dry] paqet config for $name (role ${ST[role]})"; return 0; }
-  if [[ "${ST[role]}" == foreign ]]; then
-    cat >"$f" <<EOF
-# mili paqet server (foreign) tunnel $name
-mode = server
-iface = ${ST[iface]}
-local_ip = ${ST[local_ip]}
-listen = ${ST[listen_port]}
-secret = ${ST[secret]}
-local_flag = ${ST[local_flag]}
-remote_flag = ${ST[remote_flag]}
-kcp_mode = ${ST[kcp]}
-conn = ${ST[conn]}
-mtu = ${ST[mtu]}
-nocongestion = ${ST[nocongestion]}
-EOF
-  else
-    cat >"$f" <<EOF
-# mili paqet client (Iran) tunnel $name
-mode = client
-iface = ${ST[iface]}
-local_ip = ${ST[local_ip]}
-router_mac = ${ST[router_mac]}
-remote = ${ST[foreign_ip]}:${ST[listen_port]}
-secret = ${ST[secret]}
-local_flag = ${ST[local_flag]}
-remote_flag = ${ST[remote_flag]}
-kcp_mode = ${ST[kcp]}
-conn = ${ST[conn]}
-mtu = ${ST[mtu]}
-nocongestion = ${ST[nocongestion]}
-socks = 127.0.0.1:${ST[socks_port]}
-EOF
-  fi
-  chmod 600 "$f"
 }
 
 t_paqet_unit() { echo "mili-paqet@$1.service"; }
 
-t_paqet_fw_apply() {  # <name>
-  st_load "$1"; local name="$1"
-  # raw NOTRACK + RST-drop on the paqet port (both sides) - mili chains only
-  fw_raw_notrack "$name" tcp "${ST[listen_port]}"
-  fw_drop_rst "$name" "${ST[listen_port]}"
-  if [[ "${ST[role]}" == foreign ]]; then
-    fw_allow "$name" tcp "${ST[listen_port]}"; fw_ufw_mirror "$name" tcp "${ST[listen_port]}"
-  fi
+# ============================================================================
+# pure helpers (unit-tested)
+# ============================================================================
+# KCP values, exactly as the deploy script's set_kcp_defaults / apply_kcp_preset:
+# prints "nodelay interval resend nocongestion rcvwnd sndwnd smuxbuf streambuf"
+_pq_kcp_values() {  # <preset normal|gaming|streaming> <role server|client>
+  local preset="$1" role="$2" nd=1 iv=10 rs=2 nc=1 rw sw sb=4194304 st=2097152
+  if [[ "$role" == server ]]; then rw=2048; sw=2048; else rw=1024; sw=1024; fi
+  case "$preset" in
+    gaming)
+      if [[ "$role" == server ]]; then rw=1024; sw=1024; else rw=512; sw=512; fi
+      sb=2097152; st=1048576 ;;
+    streaming)
+      if [[ "$role" == server ]]; then rw=4096; sw=4096; else rw=2048; sw=2048; fi
+      sb=8388608; st=4194304 ;;
+  esac
+  printf '%s %s %s %s %s %s %s %s' "$nd" "$iv" "$rs" "$nc" "$rw" "$sw" "$sb" "$st"
 }
 
+# TCP flag list "PA,S" -> ["PA", "S"]
+_pq_flags() {
+  local f out='' x; local -a fl=()
+  IFS=',' read -ra fl <<<"${1:-PA}"
+  for x in "${fl[@]}"; do [[ -n "$x" ]] && out+="${out:+, }\"$x\""; done
+  printf '[%s]' "${out:-\"PA\"}"
+}
+
+_pq_valid_mac() { [[ "$1" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; }
+_pq_valid_key() { local re='^[^"\\[:space:]]+$'; [[ -n "$1" && "$1" =~ $re ]]; }
+
+# forward items "L=T,L=T" -> one "L T" per line
+_pq_fwd_items() {
+  local it; local -a _pqi=()
+  IFS=',' read -ra _pqi <<<"${1// /}"
+  for it in "${_pqi[@]}"; do [[ "$it" == *=* ]] && printf '%s %s\n' "${it%%=*}" "${it#*=}"; done
+  return 0
+}
+
+# paqet's YAML (the deploy script's layout, with paqet's real key names)
+_pq_yaml() {  # <name>
+  local name="$1" role kv nd iv rs nc rw sw sb st
+  if [[ "${ST[role]}" == foreign ]]; then role=server; else role=client; fi
+  kv="$(_pq_kcp_values "${ST[kcp_preset]:-normal}" "$role")"
+  read -r nd iv rs nc rw sw sb st <<<"$kv"
+  if [[ "$role" == server ]]; then
+    printf '# mili paqet server (foreign) - tunnel %s\n' "$name"
+  else
+    printf '# mili paqet client (Iran) - tunnel %s\n' "$name"
+  fi
+  printf 'role: "%s"\n\n' "$role"
+  printf 'log:\n  level: "info"\n\n'
+  if [[ "$role" == server ]]; then
+    printf 'listen:\n  addr: ":%s"\n\n' "${ST[listen_port]}"
+  elif [[ "${ST[proxy]:-socks}" == forward ]]; then
+    printf 'forward:\n'
+    local l t
+    while read -r l t; do
+      printf '  - listen: ":%s"\n    target: "%s:%s"\n    protocol: "tcp"\n' "$l" "${ST[foreign_ip]}" "$t"
+    done < <(_pq_fwd_items "${ST[fwd]:-}")
+    printf '\n'
+  else
+    printf 'socks5:\n  - listen: "127.0.0.1:%s"\n    username: ""\n    password: ""\n\n' "${ST[socks_port]}"
+  fi
+  printf 'network:\n'
+  printf '  interface: "%s"\n' "${ST[iface]}"
+  printf '  ipv4:\n'
+  if [[ "$role" == server ]]; then
+    printf '    addr: "%s:%s"\n' "${ST[local_ip]}" "${ST[listen_port]}"
+  else
+    printf '    addr: "%s:0"\n' "${ST[local_ip]}"
+  fi
+  printf '    router_mac: "%s"\n' "${ST[router_mac]}"
+  printf '  tcp:\n    local_flag: %s\n    remote_flag: %s\n' "$(_pq_flags "${ST[local_flag]:-PA}")" "$(_pq_flags "${ST[remote_flag]:-PA}")"
+  printf '  pcap:\n    sockbuf: %s\n\n' "$([[ "$role" == server ]] && echo 8388608 || echo 4194304)"
+  if [[ "$role" == client ]]; then
+    printf 'server:\n  addr: "%s:%s"\n\n' "${ST[foreign_ip]}" "${ST[listen_port]}"
+  fi
+  printf 'transport:\n'
+  printf '  protocol: "kcp"\n'
+  printf '  conn: %s\n' "${ST[conn]:-3}"
+  printf '  kcp:\n'
+  printf '    mode: "%s"\n' "${ST[kcp]:-fast}"
+  printf '    mtu: %s\n' "${ST[mtu]:-1350}"
+  printf '    nodelay: %s\n    interval: %s\n    resend: %s\n    nocongestion: %s\n' "$nd" "$iv" "$rs" "$nc"
+  printf '    rcvwnd: %s\n    sndwnd: %s\n' "$rw" "$sw"
+  printf '    block: "aes"\n'
+  printf '    key: "%s"\n' "${ST[secret]}"
+  printf '    smuxbuf: %s\n    streambuf: %s\n' "$sb" "$st"
+}
+
+# ============================================================================
+# wizard (the deploy script's question order)
+# ============================================================================
+t_paqet_wizard() {  # <role> [level]
+  if [[ "$1" == foreign ]]; then _pq_wizard_foreign; else _pq_wizard_iran; fi
+}
+
+# ports paqet's iptables rules would wreck (README: never 80/443/standard ports)
+_pq_port_refused() {
+  local p="$1" r
+  for r in 22 53 80 443 "${MILI_RESERVED[@]}"; do [[ "$r" == "$p" ]] && return 0; done
+  ports_xui 2>/dev/null | grep -qx "$p"
+}
+
+# KCP questions, shared by both roles (connections -> mode [-> preset] -> MTU)
+_pq_ask_kcp() {
+  echo; ui_info "KCP configuration (connection tuning):"
+  ST[conn]="$(ui_ask_int '[-] Number of parallel connections (1-3 = lower bandwidth overhead)' "${ST[conn]:-3}" 1 256)"
+  local -a modes=(fast fast2 fast3 manual); local i pre=0
+  for i in "${!modes[@]}"; do [[ "${modes[$i]}" == "${ST[kcp]:-fast}" ]] && pre=$i; done
+  echo; ui_info "KCP performance mode:"
+  ui_pick "$pre" $'fast\trecommended' $'fast2\tmore aggressive' $'fast3\tmost aggressive · very high bandwidth use' $'manual\tcustom low-level parameters'
+  ST[kcp]="${modes[$((SEL-1))]}"
+  if [[ "${ST[kcp]}" == manual ]]; then
+    local -a presets=(normal gaming streaming); pre=0
+    for i in "${!presets[@]}"; do [[ "${presets[$i]}" == "${ST[kcp_preset]:-normal}" ]] && pre=$i; done
+    echo; ui_info "Manual preset:"
+    ui_pick "$pre" $'Normal\tbalanced' $'Gaming\tlow latency' $'Streaming/Downloading\thigh throughput'
+    ST[kcp_preset]="${presets[$((SEL-1))]}"
+  else
+    ST[kcp_preset]=normal
+  fi
+  ST[mtu]="$(ui_ask_int '[-] MTU (1200-1300 can help unstable links)' "${ST[mtu]:-1350}" 50 1500)"
+  ST[local_flag]="${ST[local_flag]:-PA}"; ST[remote_flag]="${ST[remote_flag]:-PA}"
+}
+
+# gateway MAC for the route out of <iface>
+_pq_gw_mac() {  # <iface>
+  local ifc="$1" gw mac
+  gw="$(ip -4 route show default dev "$ifc" 2>/dev/null | awk '{print $3; exit}')"
+  [[ -z "$gw" ]] && { sys_gw_mac 2>/dev/null; return; }
+  ping -c1 -W1 "$gw" >/dev/null 2>&1 || true
+  mac="$(ip neigh show "$gw" dev "$ifc" 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "lladdr") print $(i + 1)}' | head -n1)"
+  printf '%s' "$mac"
+}
+
+# network interface / local IPv4 / gateway MAC (auto, like the script; asks only when it must)
+_pq_ask_network() {
+  local -a ent=(); local i pre=0 mac
+  mapfile -t ent < <(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print $2 " " a[1]}')
+  if (( ${#ent[@]} > 1 )); then
+    local -a labels=()
+    for i in "${!ent[@]}"; do
+      [[ "${ent[$i]}" == "${ST[iface]:-} ${ST[local_ip]:-}" ]] && pre=$i
+      labels+=("${ent[$i]% *} → ${ent[$i]#* }")
+    done
+    echo; ui_info "Multiple IPv4 addresses - which interface/IP should paqet use?"
+    ui_pick "$pre" "${labels[@]}"
+    ST[iface]="${ent[$((SEL-1))]% *}"; ST[local_ip]="${ent[$((SEL-1))]#* }"
+  elif (( ${#ent[@]} == 1 )); then
+    ST[iface]="${ent[0]% *}"; ST[local_ip]="${ent[0]#* }"
+  else
+    ST[iface]="${ST[iface]:-$(sys_default_iface)}"; ST[local_ip]="${ST[local_ip]:-$(sys_local_ip4)}"
+  fi
+  mac="$(_pq_gw_mac "${ST[iface]}")"
+  if ! _pq_valid_mac "$mac"; then
+    ui_warn "could not detect the gateway MAC automatically (try: ip neigh)"
+    while :; do
+      mac="$(ui_ask '[*] Gateway/router MAC address' "${ST[router_mac]:-}")"
+      _pq_valid_mac "$mac" && break
+      ui_err "format: aa:bb:cc:dd:ee:ff"
+    done
+  fi
+  ST[router_mac]="$mac"
+  ui_ok "network: ${ST[iface]} · ${ST[local_ip]} · gateway MAC ${ST[router_mac]}"
+}
+
+_pq_wizard_foreign() {
+  ST[my_ip]="$(sys_public_ip4)"
+  ui_note "This FOREIGN server listens; the Iran server will dial ${ST[my_ip]}."
+  echo
+  # [*] Port to listen on
+  local p who def="${ST[listen_port]:-}"
+  [[ -z "$def" ]] && def="$(ports_free_in 9999 65535 2>/dev/null || ports_alloc_public "${ST[name]}")"
+  while :; do
+    p="$(ui_ask_int '[*] Port to listen on' "$def" 1 65535)"
+    if _pq_port_refused "$p"; then
+      ui_err "port $p is a standard / x-ui port - paqet's firewall rules would hit normal traffic. Pick a high port."; continue
+    fi
+    if who="$(ports_busy_reason "$p" "${ST[name]}")"; then ui_err "port $p is in use ($who)"; continue; fi
+    break
+  done
+  ST[listen_port]="$p"
+  # [-] connections / KCP mode / MTU
+  _pq_ask_kcp
+  # [*] encryption key (generated here, like the script; same format as `paqet secret`)
+  ST[secret]="${ST[secret]:-$(sys_rand_hex 32)}"
+  echo; ui_info "Encryption key (the Iran server needs it - shown again at the end):"
+  printf '    %s%s%s\n' "${C_YEL:-}" "${ST[secret]}" "${C_RST:-}"
+  # [*] network
+  _pq_ask_network
+  ST[mode]=socks
+  return 0
+}
+
+_pq_wizard_iran() {
+  local v p who
+  # [*] Kharej SERVER IP
+  while :; do
+    v="$(ui_ask '[*] Kharej SERVER IP address' "${ST[foreign_ip]:-}")"; v="${v// /}"
+    sys_is_ip4 "$v" && break
+    ui_err "enter the foreign server's public IPv4"
+  done
+  ST[foreign_ip]="$v"
+  # [*] SERVER port
+  ST[listen_port]="$(ui_ask_int '[*] SERVER port' "${ST[listen_port]:-9999}" 1 65535)"
+  # [*] proxy type
+  local pre=0; [[ "${ST[proxy]:-socks}" == forward ]] && pre=1
+  echo; ui_info "Proxy configuration:"
+  ui_pick "$pre" $'SOCKS5 proxy\trecommended · 3x-ui outbound → 127.0.0.1:port' \
+                 $'Port forwarding\tlocal ports → the foreign server'
+  if (( SEL == 2 )); then
+    ST[proxy]=forward
+    echo; ui_info "Port forwarding: local_port=target_port (comma separated), e.g. 443=443, 8443=8080"
+    ui_note "Targets are on the foreign server (${ST[foreign_ip]}). Don't use the paqet port (${ST[listen_port]}) as a target."
+    while :; do
+      v="$(ui_ask '[*] Port mappings' "${ST[fwd]:-}")"; v="${v// /}"
+      _pq_fwd_check "$v" && break
+    done
+    ST[fwd]="$v"
+  else
+    ST[proxy]=socks
+    while :; do
+      p="$(ui_ask_port '[*] SOCKS5 port (3x-ui outbound → 127.0.0.1:port)' "${ST[socks_port]:-$(ports_alloc_socks "${ST[name]}")}")"
+      if who="$(ports_busy_reason "$p" "${ST[name]}")" && ! [[ "$p" == "${ST[socks_port]:-}" && "$who" == paqet* ]]; then
+        ui_err "port $p is in use ($who)"; continue
+      fi
+      break
+    done
+    ST[socks_port]="$p"
+  fi
+  # [-] connections / KCP mode / MTU
+  _pq_ask_kcp
+  # [*] encryption key (must match the foreign server)
+  while :; do
+    v="$(ui_ask '[*] Encryption key (from the foreign server)' "${ST[secret]:-}")"; v="${v// /}"
+    _pq_valid_key "$v" && break
+    ui_err "paste the key the foreign server showed"
+  done
+  ST[secret]="$v"
+  # [*] network
+  _pq_ask_network
+  ST[mode]=socks
+  return 0
+}
+
+# forward mappings: format, no loop to the paqet port, local ports free
+_pq_fwd_check() {  # <list>
+  local l t who n=0 own
+  [[ -z "$1" ]] && { ui_err "enter at least one mapping"; return 1; }
+  local it; local -a items=()
+  IFS=',' read -ra items <<<"$1"
+  for it in "${items[@]}"; do
+    [[ "$it" =~ ^[0-9]+=[0-9]+$ ]] || { ui_err "invalid mapping: $it (use local=target)"; return 1; }
+    l="${it%%=*}"; t="${it#*=}"
+    (( l >= 1 && l <= 65535 && t >= 1 && t <= 65535 )) || { ui_err "ports must be 1-65535: $it"; return 1; }
+    if [[ "$t" == "${ST[listen_port]}" ]]; then
+      ui_err "unsafe: $it targets the paqet port itself (traffic loop)"; return 1
+    fi
+    own=0; [[ ",${ST[fwd]:-}," == *",$it,"* ]] && own=1
+    if who="$(ports_busy_reason "$l" "${ST[name]}")" && ! { (( own )) && [[ "$who" == paqet* ]]; }; then
+      ui_err "local port $l is in use ($who)"; return 1
+    fi
+    ((n++))
+  done
+  (( n > 3 )) && ui_note "tip: many mappings are fine; for lower bandwidth overhead keep connections at 1-3."
+  return 0
+}
+
+t_paqet_summary() {
+  local kcp="${ST[kcp]}"; [[ "$kcp" == manual ]] && kcp="manual (${ST[kcp_preset]})"
+  if [[ "${ST[role]}" == foreign ]]; then
+    ui_kv "Role" "Foreign · server (listens)"
+    ui_kv "Listen" ":${ST[listen_port]} (raw TCP packets)"
+  else
+    ui_kv "Role" "Iran · client"
+    ui_kv "Server" "${ST[foreign_ip]}:${ST[listen_port]}"
+    if [[ "${ST[proxy]}" == forward ]]; then ui_kv "Forward" "${ST[fwd]} (→ ${ST[foreign_ip]})"
+    else ui_kv "SOCKS5" "127.0.0.1:${ST[socks_port]}  (3x-ui outbound)"; fi
+  fi
+  ui_kv "KCP" "conn ${ST[conn]} · mode $kcp · MTU ${ST[mtu]}"
+  ui_kv "Encryption key" "${ST[secret]}"
+  ui_kv "Network" "${ST[iface]} · ${ST[local_ip]} · gw ${ST[router_mac]}"
+  return 0
+}
+
+# ============================================================================
+# render / firewall / ports
+# ============================================================================
+t_paqet_render() {  # <name>
+  st_load "$1"; local name="$1" f="$MILI_PQ_ETC/$1.yaml"
+  if [[ "${MILI_DRYRUN:-0}" == 1 ]]; then ui_info "[dry] would write $f:"; _pq_yaml "$name"; return 0; fi
+  mkdir -p "$MILI_PQ_ETC"
+  ( umask 077; _pq_yaml "$name" >"$f" )
+  rm -f "$MILI_PQ_ETC/$name.conf" 2>/dev/null || true    # pre-YAML builds
+}
+
+t_paqet_fw_apply() {  # <name>
+  st_load "$1"; local name="$1" l t
+  if [[ "${ST[role]}" == foreign ]]; then
+    # server side, as paqet's README / the deploy script: kernel must not track or RST the port
+    fw_raw_notrack "$name" tcp "${ST[listen_port]}"
+    fw_drop_rst "$name" "${ST[listen_port]}"
+    fw_allow "$name" tcp "${ST[listen_port]}"; fw_ufw_mirror "$name" tcp "${ST[listen_port]}"
+  elif [[ "${ST[proxy]:-socks}" == forward ]]; then
+    while read -r l t; do fw_allow "$name" tcp "$l"; fw_ufw_mirror "$name" tcp "$l"; done < <(_pq_fwd_items "${ST[fwd]:-}")
+  fi
+  return 0
+}
+
+_pq_claim() {  # <name>
+  local name="$1" l t
+  ports_release "$name"
+  if [[ "${ST[role]}" == foreign ]]; then
+    ports_claim "$name" tcp "${ST[listen_port]}" 0.0.0.0
+  elif [[ "${ST[proxy]:-socks}" == forward ]]; then
+    while read -r l t; do ports_claim "$name" tcp "$l" 0.0.0.0; done < <(_pq_fwd_items "${ST[fwd]:-}")
+  else
+    ports_claim "$name" tcp "${ST[socks_port]}" 127.0.0.1
+  fi
+  return 0
+}
+
+t_paqet_ports() {
+  st_load "$1"
+  if [[ "${ST[role]}" == foreign ]]; then echo "tcp:${ST[listen_port]}:0.0.0.0"
+  elif [[ "${ST[proxy]:-socks}" == forward ]]; then local l t; while read -r l t; do echo "tcp:$l:0.0.0.0"; done < <(_pq_fwd_items "${ST[fwd]:-}")
+  else echo "tcp:${ST[socks_port]}:127.0.0.1"; fi
+  return 0
+}
+
+# ============================================================================
+# lifecycle
+# ============================================================================
 t_paqet_up() {  # <name>
   st_load "$1"; local name="$1"
-  require_root; cores_ensure paqet
-  sys_apt_ensure libpcap0.8
+  require_root
+  cores_ensure paqet || { ui_err "paqet core install failed"; return 1; }
   t_paqet_render "$name"
   t_paqet_fw_apply "$name"
+  _pq_claim "$name"
   svc_up "mili-paqet@$name.service"
-  if [[ "${ST[role]}" == foreign ]]; then
-    ports_claim "$name" tcp "${ST[listen_port]}" "0.0.0.0"
-  else
-    ports_claim "$name" tcp "${ST[socks_port]}" "127.0.0.1"
+}
+
+# create / Edit: write config, check it (client: paqet ping), RESTART, verify
+t_paqet_provision() {  # <name>
+  st_load "$1"; local name="$1" u="mili-paqet@$1.service" out
+  require_root
+  cores_ensure paqet || { ui_err "paqet core install failed"; return 1; }
+  t_paqet_render "$name" || return 1
+  fw_remove "$name"; t_paqet_fw_apply "$name"
+  _pq_claim "$name"
+  if [[ "${ST[role]}" == iran && "${MILI_DRYRUN:-0}" != 1 ]]; then
+    # the deploy script's connectivity test: parses the config and sends one raw packet
+    out="$("$(cores_path paqet)" ping -c "$MILI_PQ_ETC/$name.yaml" 2>&1)"
+    if grep -qiE 'failed to parse configuration|validation failed' <<<"$out"; then
+      ui_err "paqet rejected the config:"; printf '%s\n' "$out" | tail -n 8; return 1
+    fi
+    if grep -q 'packet sent successfully' <<<"$out"; then ui_ok "config OK · test packet sent to ${ST[foreign_ip]}:${ST[listen_port]}"
+    else ui_warn "paqet ping: $(printf '%s' "$out" | tail -n 1)"; fi
   fi
+  svc_enable "$u"
+  run systemctl restart "$u" || { ui_err "could not start $u"; svc_logs "$u" 20; return 1; }
+  _pq_verify "$name"
+}
+
+# exit IP through the local SOCKS (empty = no traffic through the tunnel)
+_pq_exit_ip() { curl -fsS --max-time "${2:-10}" --socks5-hostname "127.0.0.1:$1" https://api.ipify.org 2>/dev/null | tr -d '[:space:]'; }
+
+_pq_verify() {  # <name>
+  local name="$1" u="mili-paqet@$1.service" i errs l t xip
+  [[ "${MILI_DRYRUN:-0}" == 1 ]] && { ui_info "[dry] skipping live checks"; return 0; }
+  for (( i = 0; i < 3; i++ )); do sleep 1; svc_active "$u" || break; done
+  errs="$(journalctl -u "$u" -n 30 --no-pager 2>/dev/null | grep -iE 'failed to parse configuration|validation failed|fatal' | tail -n 5)"
+  if ! svc_active "$u" || [[ -n "$errs" ]]; then
+    ui_err "paqet did not stay up:"; [[ -n "$errs" ]] && printf '%s\n' "$errs" || journalctl -u "$u" -n 15 --no-pager 2>/dev/null
+    return 1
+  fi
+  if [[ "${ST[role]}" == foreign ]]; then
+    ui_ok "paqet server running on :${ST[listen_port]} (raw packets via ${ST[iface]})"
+    return 0
+  fi
+  if [[ "${ST[proxy]:-socks}" == forward ]]; then
+    while read -r l t; do
+      for (( i = 0; i < 5; i++ )); do ports_listening "$l" && break; sleep 1; done
+      if ports_listening "$l"; then ui_ok "forward :$l → ${ST[foreign_ip]}:$t"; else ui_err "forward :$l is not listening"; return 1; fi
+    done < <(_pq_fwd_items "${ST[fwd]:-}")
+    return 0
+  fi
+  for (( i = 0; i < 6; i++ )); do ports_listening "${ST[socks_port]}" && break; sleep 1; done
+  ports_listening "${ST[socks_port]}" || { ui_err "SOCKS5 is not listening on 127.0.0.1:${ST[socks_port]}"; return 1; }
+  ui_ok "SOCKS5 ready on 127.0.0.1:${ST[socks_port]}"
+  xip="$(_pq_exit_ip "${ST[socks_port]}" 12)"
+  if [[ -n "$xip" ]]; then
+    ui_ok "traffic flows through the tunnel · exit IP $xip"
+  else
+    ui_warn "no traffic through the tunnel yet. Check: the foreign paqet tunnel is up, port + key match,"
+    ui_warn "and TCP ${ST[listen_port]} is allowed in the FOREIGN provider's firewall (cloud panel)."
+  fi
+  return 0
 }
 
 t_paqet_down() {  # <name>
@@ -4176,82 +4959,82 @@ t_paqet_down() {  # <name>
   fw_remove "$1"
 }
 
-t_paqet_purge() { run rm -f "$MILI_PQ_ETC/$1.conf" 2>/dev/null || true; }
+t_paqet_purge() { run rm -f "$MILI_PQ_ETC/$1.yaml" "$MILI_PQ_ETC/$1.conf" 2>/dev/null || true; }
 
+# cheap (menu): server = service running; client = its local listener is up
 t_paqet_health() {  # <name>
   st_load "$1"
-  if [[ "${ST[role]}" == iran ]]; then
-    ss -Hlnt 2>/dev/null | awk '{print $4}' | grep -qE ":${ST[socks_port]}\$"
-  else
-    svc_active "mili-paqet@$1.service"
+  if [[ "${ST[role]}" == foreign ]]; then svc_active "mili-paqet@$1.service"; return; fi
+  if [[ "${ST[proxy]:-socks}" == forward ]]; then
+    local l t; read -r l t < <(_pq_fwd_items "${ST[fwd]:-}"); [[ -n "$l" ]] && ports_listening "$l"; return
   fi
+  ports_listening "${ST[socks_port]}"
 }
-
-t_paqet_ports() {
+# deeper (watchdog only): the client SOCKS must actually carry traffic
+t_paqet_probe() {  # <name>
   st_load "$1"
-  [[ "${ST[role]}" == foreign ]] && echo "tcp:${ST[listen_port]}:0.0.0.0"
-  [[ "${ST[role]}" == iran ]] && echo "tcp:${ST[socks_port]}:127.0.0.1"
+  if [[ "${ST[role]}" == iran && "${ST[proxy]:-socks}" == socks ]]; then
+    curl -fsS --max-time 6 --socks5-hostname "127.0.0.1:${ST[socks_port]}" https://www.gstatic.com/generate_204 -o /dev/null 2>/dev/null
+    return
+  fi
+  t_paqet_health "$1"
 }
 
 t_paqet_info() {
   st_load "$1"
-  ui_kv "role" "${ST[role]}"
-  ui_kv "kcp" "${ST[kcp]} conn=${ST[conn]} mtu=${ST[mtu]}"
-  ui_kv "flags" "local=${ST[local_flag]} remote=${ST[remote_flag]}"
+  local kcp="${ST[kcp]:-fast}"; [[ "$kcp" == manual ]] && kcp="manual (${ST[kcp_preset]:-normal})"
+  ui_kv "kcp" "conn ${ST[conn]:-3} · mode $kcp · MTU ${ST[mtu]:-1350}"
   if [[ "${ST[role]}" == foreign ]]; then
-    ui_kv "listen" "0.0.0.0:${ST[listen_port]} (raw)"
+    ui_kv "role" "Foreign · server, raw port :${ST[listen_port]}"
   else
-    ui_kv "dials" "${ST[foreign_ip]}:${ST[listen_port]}"
-    echo; xui_outbound_box "127.0.0.1" "${ST[socks_port]}" "" ""
+    ui_kv "role" "Iran · client → ${ST[foreign_ip]}:${ST[listen_port]}"
+    if [[ "${ST[proxy]:-socks}" == forward ]]; then ui_kv "forward" "${ST[fwd]}"
+    else echo; xui_outbound_box "127.0.0.1" "${ST[socks_port]}" "" ""; fi
   fi
+  return 0
 }
 
 t_paqet_xui() {
   st_load "$1"; local name="$1"
-  if [[ "${ST[role]}" == iran ]]; then
-    # paqet client socks5 has no auth by default
-    xui_help_socks "$name" "127.0.0.1" "${ST[socks_port]}" "" ""
+  if [[ "${ST[role]}" == iran && "${ST[proxy]:-socks}" == socks ]]; then
+    xui_help_socks "$name" "127.0.0.1" "${ST[socks_port]}" "" ""      # paqet's SOCKS5: no auth
+  elif [[ "${ST[role]}" == iran ]]; then
+    ui_head "Use '$name' with 3x-ui (port forward)"; ui_note "local ports → foreign: ${ST[fwd]}"
   else
-    ui_warn "paqet SOCKS endpoint is on the IRAN (client) server at 127.0.0.1:${ST[socks_port]}."
+    ui_warn "the 3x-ui SOCKS outbound is on the IRAN server: Manage → its paqet tunnel → 3x-ui JSON helper."
   fi
 }
 
 t_paqet_test() {
   st_load "$1"
-  if [[ "${ST[role]}" == iran ]]; then doctor_socks 127.0.0.1 "${ST[socks_port]}"; else t_paqet_health "$1" && ui_ok "paqet server up" || ui_err "down"; fi
+  if [[ "${ST[role]}" == iran && "${ST[proxy]:-socks}" == socks ]]; then
+    doctor_socks 127.0.0.1 "${ST[socks_port]}"
+  elif t_paqet_health "$1"; then ui_ok "paqet up"
+  else ui_err "paqet down"; return 1; fi
 }
 
-t_paqet_pair_export() {
+# what to type on the other server (paqet has no token blob: IP, port, key)
+t_paqet_handoff() {  # <name>
   st_load "$1"
-  local peerrole; [[ "${ST[role]}" == foreign ]] && peerrole=iran || peerrole=foreign
-  cat <<EOF
-type=paqet
-name=${ST[name]}
-role=$peerrole
-listen_port=${ST[listen_port]}
-secret=${ST[secret]}
-foreign_ip=${ST[my_ip]:-${ST[foreign_ip]:-}}
-local_flag=${ST[local_flag]}
-remote_flag=${ST[remote_flag]}
-kcp=${ST[kcp]}
-conn=${ST[conn]}
-mtu=${ST[mtu]}
-nocongestion=${ST[nocongestion]}
-EOF
-}
-
-t_paqet_pair_import() {
-  local p="$1" name role k
-  name="$(pair_field "$p" name)"; role="$(pair_field "$p" role)"
-  ST=(); ST[name]="$name"; ST[type]=paqet; ST[role]="$role"; ST[mode]=socks
-  for k in listen_port secret foreign_ip local_flag remote_flag kcp conn mtu nocongestion; do
-    ST[$k]="$(pair_field "$p" "$k")"
-  done
-  ST[iface]="$(sys_default_iface)"; ST[local_ip]="$(sys_local_ip4)"; ST[router_mac]="$(sys_gw_mac 2>/dev/null)"
-  [[ "$role" == foreign ]] && ST[my_ip]="$(sys_public_ip4)"
-  [[ "$role" == iran ]] && ST[socks_port]="$(ports_alloc_socks)"
-  st_save
-  t_paqet_up "$name"; st_set state up; st_save
+  if [[ "${ST[role]}" == foreign ]]; then
+    ui_head "paqet '$1' - type these on the IRAN server"
+    ui_note "There: mili → New tunnel → paqet → Iran"
+    ui_warn "the key is a secret - share it only with your Iran server"
+    echo
+    ui_kv "Kharej SERVER IP" "${ST[my_ip]:-$(sys_public_ip4)}"
+    ui_kv "SERVER port" "${ST[listen_port]}"
+    ui_kv "Encryption key" "${ST[secret]}"
+    if [[ "${ST[conn]}" != 3 || "${ST[kcp]}" != fast || "${ST[mtu]}" != 1350 ]]; then
+      ui_kv "Same tuning" "connections ${ST[conn]} · KCP ${ST[kcp]}$([[ "${ST[kcp]}" == manual ]] && echo "/${ST[kcp_preset]}") · MTU ${ST[mtu]}"
+    fi
+    echo; ui_note "Every other question: press Enter."
+    ui_note "If this server's provider has a firewall panel (cloud security group), allow TCP ${ST[listen_port]}."
+  else
+    ui_head "paqet '$1' - Iran side"
+    if [[ "${ST[proxy]:-socks}" == socks ]]; then xui_outbound_box "127.0.0.1" "${ST[socks_port]}" "" ""
+    else ui_kv "forward" "${ST[fwd]} → ${ST[foreign_ip]}"; fi
+  fi
+  return 0
 }
 
 # ===== main.sh =====
@@ -4358,7 +5141,7 @@ _role_hint() {  # <type> <role>
 
 mili_new_tunnel() {
   ui_clear; ui_head "New tunnel"
-  ui_note "You configure THIS server here, then carry ONE code/token to the other server."
+  ui_note "You configure THIS server here; it then shows what to use on the other server."
   echo
 
   # ---- 1) tunnel type (arrow) ----
@@ -4564,7 +5347,15 @@ mili_import_code() {  # [code]
   name="$(pair_field "$payload" name)"
   reply="$(pair_field "$payload" reply)"
   [[ -z "$type" || -z "$name" ]] && { ui_err "code missing type/name"; ui_pause; return 1; }
-  t_has "$type" pair_import || { ui_err "unknown tunnel type in code: $type"; ui_pause; return 1; }
+  if ! t_has "$type" pair_import; then
+    if [[ "$(t_meta_field "$type" pairing 2>/dev/null)" == native ]]; then
+      ui_err "$type no longer uses mili pairing codes — it uses its own values now."
+      ui_note "New tunnel → $(t_meta_field "$type" title) → pick this server's side, and type the values the other server shows."
+    else
+      ui_err "unknown tunnel type in code: $type"
+    fi
+    ui_pause; return 1
+  fi
   require_root; fw_init; svc_install_templates
 
   # ---- a REPLY code: finalize the tunnel WE generated earlier ----
@@ -4915,10 +5706,10 @@ mili_svc_exec() {
       [[ -x "$_bin" && -f "$_cfg" ]] || die "backhaul core/config missing"
       exec "$_bin" -c "$_cfg" ;;
     paqet)
-      local _cfg="$MILI_ETC/engines/paqet/$name.conf" _bin
+      local _cfg="$MILI_ETC/engines/paqet/$name.yaml" _bin
       _bin="$(cores_path paqet)"
       [[ -x "$_bin" && -f "$_cfg" ]] || die "paqet core/config missing"
-      exec "$_bin" -c "$_cfg" ;;
+      exec "$_bin" run -c "$_cfg" ;;
     *)
       # generic: module provides t_<type>_svc_exec that execs the core
       local type; st_load "$name" >/dev/null 2>&1 && type="$(st_get type)"

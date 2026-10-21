@@ -87,6 +87,47 @@ ports_alloc_public()   { ports_alloc "$MILI_PUB_LO"   "$MILI_PUB_HI"   "$1"; }
 ports_alloc_socks()    { ports_alloc "$MILI_SOCKS_LO" "$MILI_SOCKS_HI" "$1"; }
 ports_alloc_internal() { ports_alloc "$MILI_INT_LO"   "$MILI_INT_HI"   "$1"; }
 
+# ---- live listener helpers (wizards) ----------------------------------------
+# is anything listening on tcp <port>?
+ports_listening() { ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE ":$1\$"; }
+
+# who listens on tcp <port>? prints the process name ('?' if hidden); rc 1 = free
+ports_who() {
+  local line who
+  line="$(ss -Hltnp 2>/dev/null | awk -v p="$1" '{n = split($4, a, ":"); if (a[n] == p) { print; exit }}')"
+  [[ -z "$line" ]] && return 1
+  who="$(printf '%s' "$line" | grep -oE 'users:\(\("[^"]+' | head -n1 | sed 's/^users:(("//')"
+  printf '%s' "${who:-?}"
+}
+
+# is <port> unavailable? prints the reason (process / x-ui / another mili tunnel).
+# Listeners whose process name starts with <ignore-prefix> don't count (a core
+# re-binding its own port). MILI_RESERVED is NOT consulted (callers decide).
+ports_busy_reason() {  # <port> [exclude-tunnel] [ignore-prefix]
+  local port="$1" excl="${2:-}" ign="${3:-}" who
+  if who="$(ports_who "$port")"; then
+    if [[ -z "$ign" || "$who" != "$ign"* ]]; then printf '%s' "$who"; return 0; fi
+  fi
+  if ports_xui 2>/dev/null | grep -qx "$port"; then printf 'x-ui'; return 0; fi
+  if [[ -f "$MILI_PORTSDB" ]] && awk -F'|' -v pt="$port" -v ex="$excl" '$3==pt && $1!=ex {f=1} END {exit !f}' "$MILI_PORTSDB"; then
+    printf 'another mili tunnel'; return 0
+  fi
+  return 1
+}
+
+# first free port in [lo, hi] that is not in <taken...>
+ports_free_in() {  # <lo> <hi> [taken...]
+  local lo="$1" hi="$2" p t skip; shift 2
+  for (( p = lo; p <= hi; p++ )); do
+    skip=0; for t in "$@"; do [[ "$t" == "$p" ]] && { skip=1; break; }; done
+    (( skip )) && continue
+    ports_in_use "$p" && continue
+    printf '%s' "$p"; return 0
+  done
+  return 1
+}
+ports_free_public() { ports_free_in "$MILI_PUB_LO" "$MILI_PUB_HI" "$@"; }
+
 # ---- claim / release -------------------------------------------------------
 ports_claim() {   # <name> <proto> <port> <bind>
   ports_db_init

@@ -145,7 +145,7 @@ TOKF=eyJ2IjoyLCJpcCI6IjkuOS45LjkiLCJhdXRoIjoiYWFiYmNjZGRlZWZmMDAxMTIyMzM0NDU1NjY
   [ "$(_hed_cfg_role "$f")" = iran ]
   [ "$(_hed_cfg_node_count "$f")" -eq 2 ]
   _hed_cfg_has_node DE-01 "$f"
-  ! _hed_cfg_has_node hed "$f"
+  refute _hed_cfg_has_node hed "$f"
   run _hed_token_build 9.9.9.9 "$f"
   [ "$status" -ne 0 ]
 }

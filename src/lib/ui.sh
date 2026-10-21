@@ -190,6 +190,14 @@ ui_select() {
   tput cnorm 2>/dev/null || true
 }
 
+# ui_pick <preselect-index> <item>... : like ui_select, but a wizard question:
+# cancel / blank answer keeps the preselected item (Enter-default semantics).
+ui_pick() {
+  local pre="${1:-0}"
+  ui_select "$@"
+  (( SEL >= 1 && SEL < $# )) || SEL=$(( pre + 1 ))
+}
+
 # ---- prompts ---------------------------------------------------------------
 # ask <prompt> <default> -> echoes answer
 ui_ask() {
@@ -218,6 +226,41 @@ ui_confirm() {
   read -r -p "$(printf '%s? %s%s %s%s%s ' "$C_YEL" "$C_RST" "$p" "$C_GRY" "$hint" "$C_RST")" ans || true
   ans="${ans:-$def}"
   [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# ask a tcp/udp port (1-65535) -> echoes it
+ui_ask_port() {  # <prompt> <default>
+  local v
+  while :; do
+    v="$(ui_ask "$1" "$2")"
+    [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )) && { printf '%s' "$v"; return 0; }
+    ui_err "port must be 1-65535" >&2
+  done
+}
+
+# ask a whole number in [min, max] -> echoes it
+ui_ask_int() {  # <prompt> <default> <min> [max]
+  local v max="${4:-}"
+  while :; do
+    v="$(ui_ask "$1" "$2")"
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= $3 )) && [[ -z "$max" || "$v" -le "$max" ]]; then
+      printf '%s' "$v"; return 0
+    fi
+    if [[ -n "$max" ]]; then ui_err "enter a whole number $3-$max" >&2; else ui_err "enter a whole number >= $3" >&2; fi
+  done
+}
+
+# ask true/false (also accepts y/n/yes/no/1/0) -> echoes true|false
+ui_ask_bool() {  # <prompt> <default true|false>
+  local v
+  while :; do
+    v="$(ui_ask "$1 (true/false)" "$2")"
+    case "${v,,}" in
+      true|t|y|yes|1)  printf 'true';  return 0 ;;
+      false|f|n|no|0)  printf 'false'; return 0 ;;
+    esac
+    ui_err "enter true or false" >&2
+  done
 }
 
 # pause until Enter

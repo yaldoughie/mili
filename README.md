@@ -80,8 +80,8 @@ run `mili`. Core binaries move with `mili cores bundle` /
 | **GRE** | kernel GRE / GRE-in-UDP (FOU) / ip6gre | symmetric | lowest overhead L3; FOU evades proto-47 blocks |
 | **GRE+FRP** | FRP *inside* a private GRE | Iran (inner IP) | stealth: only GRE/FOU is visible, no public FRP port |
 | **FRP** | fatedier/frp reverse | Iran (public) | simple reverse tunnel over the open net |
-| **Backhaul** | tcp/mux/ws/wss/udp | Iran | high-throughput muxed reverse tunnel |
-| **paqet** | raw pcap packets + KCP | Foreign | aggressive anti-DPI, TCP-flag cycling |
+| **Backhaul** | tcp/mux/ws/wss/udp (own values) | Iran | high-throughput muxed reverse tunnel |
+| **paqet** | raw pcap packets + KCP (own values) | Foreign | aggressive anti-DPI, TCP-flag cycling |
 | **Hedioum** | mimic pool SOCKS (native token) | Foreign egress | persona/mimic traffic shaping |
 
 All tunnels coexist. Any tunnel may layer over another's inner IP (that is how
@@ -135,12 +135,21 @@ counts come from stored state and the public IP is fetched once and cached.
   Cores (binaries)      Update · Uninstall · Exit
 ```
 
-**Pairing model (servers find each other automatically — no typing IPs):**
-The side that **listens** generates the code and auto-embeds **its own public
-IP**; the other side pastes it and dials back automatically.
+**Pairing model.** Each tunnel is set up the way its own core's installer does
+it — same questions, same order, every one with an Enter default. Set up the
+side that **listens** first; it shows exactly what to use on the other server.
 
-- **Backhaul / FRP** → set up on **Iran** (it listens) → one code → paste on Foreign. Done.
-- **paqet** → set up on **Foreign** (it listens) → one code → paste on Iran. Done.
+- **Backhaul** (Musixal installer flow) → *New tunnel → Backhaul → Iran*
+  (tunnel port, transport, token, … then SOCKS or port-forward). Iran shows four
+  values — **Iran IP, tunnel port, transport, token** (+ the SOCKS port) — type
+  them on Foreign: *New tunnel → Backhaul → Foreign*. SOCKS mode needs no
+  password: both ends of the SOCKS hop are loopback-only.
+- **paqet** (paqet-tunnel deploy-script flow, paqet's own YAML) → *New tunnel →
+  paqet → Foreign* (port, connections, KCP mode, MTU; key generated, network
+  auto-detected). Foreign shows **IP, port, key** → type them on Iran: *New
+  tunnel → paqet → Iran* → SOCKS5 for 3x-ui (or port forwarding). mili then
+  checks the exit IP through the tunnel.
+- **FRP** → set up on **Iran** (it listens) → one mili code → paste on Foreign.
 - **Hedioum** uses **its own pairing token**, not a mili code. mili asks the
   same questions as hedioum's own wizard (Enter accepts every default):
   **Foreign** → *New tunnel → Hedioum → Foreign* → mili runs

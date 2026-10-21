@@ -102,7 +102,7 @@ _role_hint() {  # <type> <role>
 
 mili_new_tunnel() {
   ui_clear; ui_head "New tunnel"
-  ui_note "You configure THIS server here, then carry ONE code/token to the other server."
+  ui_note "You configure THIS server here; it then shows what to use on the other server."
   echo
 
   # ---- 1) tunnel type (arrow) ----
@@ -308,7 +308,15 @@ mili_import_code() {  # [code]
   name="$(pair_field "$payload" name)"
   reply="$(pair_field "$payload" reply)"
   [[ -z "$type" || -z "$name" ]] && { ui_err "code missing type/name"; ui_pause; return 1; }
-  t_has "$type" pair_import || { ui_err "unknown tunnel type in code: $type"; ui_pause; return 1; }
+  if ! t_has "$type" pair_import; then
+    if [[ "$(t_meta_field "$type" pairing 2>/dev/null)" == native ]]; then
+      ui_err "$type no longer uses mili pairing codes — it uses its own values now."
+      ui_note "New tunnel → $(t_meta_field "$type" title) → pick this server's side, and type the values the other server shows."
+    else
+      ui_err "unknown tunnel type in code: $type"
+    fi
+    ui_pause; return 1
+  fi
   require_root; fw_init; svc_install_templates
 
   # ---- a REPLY code: finalize the tunnel WE generated earlier ----
@@ -659,10 +667,10 @@ mili_svc_exec() {
       [[ -x "$_bin" && -f "$_cfg" ]] || die "backhaul core/config missing"
       exec "$_bin" -c "$_cfg" ;;
     paqet)
-      local _cfg="$MILI_ETC/engines/paqet/$name.conf" _bin
+      local _cfg="$MILI_ETC/engines/paqet/$name.yaml" _bin
       _bin="$(cores_path paqet)"
       [[ -x "$_bin" && -f "$_cfg" ]] || die "paqet core/config missing"
-      exec "$_bin" -c "$_cfg" ;;
+      exec "$_bin" run -c "$_cfg" ;;
     *)
       # generic: module provides t_<type>_svc_exec that execs the core
       local type; st_load "$name" >/dev/null 2>&1 && type="$(st_get type)"

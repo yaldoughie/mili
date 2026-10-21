@@ -36,7 +36,11 @@ socks_exec() {  # <name>
   . "$f"
   gost="$(cores_path gost)"
   [[ -x "$gost" ]] || die "gost core not installed"
-  exec "$gost" -L "socks5://${SOCKS_USER}:${SOCKS_PASS}@${SOCKS_BIND}:${SOCKS_PORT}?udp=true"
+  if [[ -n "${SOCKS_USER:-}" ]]; then
+    exec "$gost" -L "socks5://${SOCKS_USER}:${SOCKS_PASS}@${SOCKS_BIND}:${SOCKS_PORT}?udp=true"
+  fi
+  # no user = no auth (loopback-only helper reached only through the tunnel)
+  exec "$gost" -L "socks5://${SOCKS_BIND}:${SOCKS_PORT}?udp=true"
 }
 
 socks_remove() { run rm -f "$MILI_SOCKS_DIR/$1.env" 2>/dev/null || true; }

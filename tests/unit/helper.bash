@@ -17,3 +17,6 @@ mili_load() {
   # never touch the real host from unit tests
   sysctl_set_reserved_ports() { :; }
 }
+
+# negative assert that really fails the test (bats/set -e ignores a bare `! cmd`)
+refute() { if "$@"; then echo "unexpectedly succeeded: $*"; return 1; fi; return 0; }

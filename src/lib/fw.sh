@@ -48,18 +48,23 @@ fw_rehook() {
   # mangle FORWARD -> MSS clamp
   _iptq  -t mangle -C FORWARD -j MILI-MSS || _ipt  -t mangle -I FORWARD 1 -j MILI-MSS
   _ipt6q -t mangle -C FORWARD -j MILI-MSS || _ipt6 -t mangle -I FORWARD 1 -j MILI-MSS
-  # raw PREROUTING -> MILI-RAW  (paqet NOTRACK)
+  # raw PREROUTING + OUTPUT -> MILI-RAW  (paqet NOTRACK: --dport in, --sport out)
   _iptq  -t raw -C PREROUTING -j MILI-RAW || _ipt  -t raw -I PREROUTING 1 -j MILI-RAW
+  _iptq  -t raw -C OUTPUT     -j MILI-RAW || _ipt  -t raw -I OUTPUT 1 -j MILI-RAW
   # mangle OUTPUT -> MILI-OUT (paqet RST drop)
   _iptq  -t mangle -C OUTPUT -j MILI-OUT || _ipt -t mangle -I OUTPUT 1 -j MILI-OUT
 }
 
 # add a filter ACCEPT:  fw_allow <name> <proto> <port|range> [src]
+# a range may be given as a-b (backhaul/ports syntax) or a:b (iptables syntax)
 fw_allow() {
-  local name="$1" proto="$2" port="$3" src="${4:-}" tag="$FW_TAGPFX:$1"
+  local name="$1" proto="$2" port="${3:-}" src="${4:-}" tag="$FW_TAGPFX:$1"
+  [[ "$port" == - ]] && port=''
+  [[ "$port" =~ ^[0-9]+-[0-9]+$ ]] && port="${port/-/:}"
+  [[ "$src" == any ]] && src=''
   local -a a=(-t filter -A MILI-IN -p "$proto")
-  [[ -n "$src" && "$src" != any ]] && a+=(-s "$src")
-  [[ -n "$port" && "$port" != - ]] && a+=(--dport "$port")
+  [[ -n "$src" ]] && a+=(-s "$src")
+  [[ -n "$port" ]] && a+=(--dport "$port")
   a+=(-m comment --comment "$tag" -j ACCEPT)
   _iptq -t filter -C MILI-IN -p "$proto" ${src:+-s "$src"} ${port:+--dport "$port"} -m comment --comment "$tag" -j ACCEPT \
     || _ipt "${a[@]}"
@@ -151,6 +156,7 @@ fw_teardown() {
   _iptq  -t nat -D POSTROUTING -j MILI-POST; _ipt6q -t nat -D POSTROUTING -j MILI-POST
   _iptq  -t mangle -D FORWARD -j MILI-MSS; _ipt6q -t mangle -D FORWARD -j MILI-MSS
   _iptq  -t raw -D PREROUTING -j MILI-RAW
+  _iptq  -t raw -D OUTPUT -j MILI-RAW
   _iptq  -t mangle -D OUTPUT -j MILI-OUT
   for table in filter nat mangle raw; do
     for chain in MILI-IN MILI-PRE MILI-POST MILI-MSS MILI-OUT MILI-RAW; do
