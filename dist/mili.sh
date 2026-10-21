@@ -3139,14 +3139,13 @@ t_hedioum_up() {  # <name>
       ui_info "running: hedioum-tunnel ${a[*]}"
       local out; out="$(run "$b" "${a[@]}" 2>&1)"
       printf '%s\n' "$out" | sed 's/^/    /'
-      printf '%s\n' "$out" >"$MILI_ETC/engines/hedioum-$name.out" 2>/dev/null || true
-      ST[token]="$(_hed_extract_token "$out")"
-      # fallback: ask the operator to paste it from the output above
-      if [[ -z "${ST[token]}" ]]; then
-        ui_warn "could not auto-detect the pairing token in the output above."
-        ui_note "copy the token string hedioum printed and paste it here."
-        ST[token]="$(ui_ask 'Hedioum pairing token' '')"
-      fi
+      printf '%s\n' "$out" >"$MILI_LOGDIR/hedioum-$name.setup.log" 2>/dev/null || true
+      # Do NOT trust auto-capture (hedioum prints a v2 token in its own format).
+      # Show the output and have the operator confirm the exact token string.
+      local guess; guess="$(_hed_extract_token "$out")"
+      echo; ui_info "copy the PAIRING TOKEN from the output above (the long v2 token)."
+      [[ -n "$guess" ]] && ui_note "auto-detected guess shown as default — fix it if wrong."
+      ST[token]="$(ui_ask 'Paste the exact pairing token' "$guess")"
       if [[ -z "${ST[token]}" ]]; then
         ui_err "no token — Iran side cannot pair. Fix setup-foreign and retry."
         run systemctl disable --now hedioum.service >/dev/null 2>&1 || true
@@ -3285,7 +3284,8 @@ t_hedioum_pair_import() {
   ST[alias]="$(hostname -s 2>/dev/null || echo iran)"
   ST[socks_port]="$(ports_alloc_socks)"
   st_save
-  t_hedioum_up "$name"; st_set state up; st_save
+  if t_hedioum_up "$name"; then st_set state up; st_save; return 0
+  else st_set state down; st_save; return 1; fi
 }
 
 # ===== tunnels/paqet.sh =====
@@ -3543,9 +3543,12 @@ mili_up() {   # <name>
   type="$(st_get type)"
   fw_init
   t_has "$type" render && t_call "$type" render "$name"
-  t_call "$type" up "$name"
-  st_set state up; st_save
-  ui_ok "tunnel '$name' is up"
+  if t_call "$type" up "$name"; then
+    st_set state up; st_save; ui_ok "tunnel '$name' is up"
+  else
+    st_set state down; st_save; ui_warn "tunnel '$name' did not come up (see messages above)"
+    return 1
+  fi
 }
 
 mili_down() {  # <name>
@@ -3670,9 +3673,11 @@ mili_new_tunnel() {
   fw_init
   svc_install_templates
   t_has "$type" render && t_call "$type" render "$name"
-  t_call "$type" up "$name"
-  st_set state up; st_save
-  ui_ok "tunnel '$name' created and started"
+  if t_call "$type" up "$name"; then
+    st_set state up; st_save; ui_ok "tunnel '$name' created and started"
+  else
+    st_set state down; st_save; ui_warn "tunnel '$name' created but NOT started (fix the issue above, then Start it)"
+  fi
 
   # ---- 7) pairing code (generator side emits ONE code carrying its own IP) ----
   if t_has "$type" pair_export; then

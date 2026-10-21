@@ -36,9 +36,12 @@ mili_up() {   # <name>
   type="$(st_get type)"
   fw_init
   t_has "$type" render && t_call "$type" render "$name"
-  t_call "$type" up "$name"
-  st_set state up; st_save
-  ui_ok "tunnel '$name' is up"
+  if t_call "$type" up "$name"; then
+    st_set state up; st_save; ui_ok "tunnel '$name' is up"
+  else
+    st_set state down; st_save; ui_warn "tunnel '$name' did not come up (see messages above)"
+    return 1
+  fi
 }
 
 mili_down() {  # <name>
@@ -163,9 +166,11 @@ mili_new_tunnel() {
   fw_init
   svc_install_templates
   t_has "$type" render && t_call "$type" render "$name"
-  t_call "$type" up "$name"
-  st_set state up; st_save
-  ui_ok "tunnel '$name' created and started"
+  if t_call "$type" up "$name"; then
+    st_set state up; st_save; ui_ok "tunnel '$name' created and started"
+  else
+    st_set state down; st_save; ui_warn "tunnel '$name' created but NOT started (fix the issue above, then Start it)"
+  fi
 
   # ---- 7) pairing code (generator side emits ONE code carrying its own IP) ----
   if t_has "$type" pair_export; then
