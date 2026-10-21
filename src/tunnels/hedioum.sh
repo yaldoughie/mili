@@ -18,6 +18,16 @@ _hed_bin() {
   return 1
 }
 
+# true once hedioum has written its config (the daemon needs it, else it loops)
+_hed_configured() {
+  local d
+  for d in /etc/hedioum /root/.config/hedioum /root/.hedioum /var/lib/hedioum; do
+    # any non-empty regular file counts as "configured"
+    [[ -n "$(find "$d" -type f ! -empty 2>/dev/null | head -n1)" ]] && return 0
+  done
+  return 1
+}
+
 # pull the pairing token out of setup-foreign output (several heuristics)
 _hed_extract_token() {
   local out="$1" tok
@@ -126,39 +136,40 @@ t_hedioum_up() {  # <name>
       ui_ok "pairing token stored"
       st_save
     fi
-    # config now exists on foreign -> safe to start the daemon
-    _hed_start_if_configured || { ui_err "hedioum has no config yet; not starting the crash-looping service"; return 1; }
+    _hed_finish "$name" "$out" || return 1
   else
-    # iran hub (reached via import). A bad/expired token => setup-iran fails and
-    # the daemon would crash-loop with "No configuration found"; guard against it.
+    # iran hub (reached via import). The ONLY reliable success signal is that a
+    # config file appears; a bad token writes nothing and the daemon loops.
     [[ -z "${ST[token]:-}" ]] && { ui_err "no token stored - import the foreign pairing code instead"; return 1; }
-    local out rc
+    local out
     ui_info "running: hedioum-tunnel setup-iran --alias ${ST[alias]:-iran} --socks-port ${ST[socks_port]} --token ***"
-    out="$(run "$b" setup-iran --alias "${ST[alias]:-iran}" --token "${ST[token]}" --socks-port "${ST[socks_port]}" 2>&1)"; rc=$?
+    out="$(run "$b" setup-iran --alias "${ST[alias]:-iran}" --token "${ST[token]}" --socks-port "${ST[socks_port]}" 2>&1)"
     printf '%s\n' "$out" | sed 's/^/    /'
-    if (( rc != 0 )) || printf '%s' "$out" | grep -qiE 'error|invalid|expired|fail|usage of'; then
-      ui_err "setup-iran failed — the pairing token is wrong or expired."
-      ui_note "Re-generate it on the foreign server and import the fresh code here."
-      run systemctl disable --now hedioum.service >/dev/null 2>&1 || true
-      return 1
-    fi
     ports_claim "$name" tcp "${ST[socks_port]}" "127.0.0.1"
     fw_loopback_guard "$name" tcp "${ST[socks_port]}"
-    _hed_start_if_configured || { ui_err "hedioum config missing after setup-iran; not starting"; return 1; }
+    _hed_finish "$name" "$out" || return 1
   fi
 }
 
-# start hedioum.service only once a config exists (else it crash-loops forever)
-_hed_start_if_configured() {
-  # hedioum stores its config under /etc/hedioum (Docker volume hint in README)
-  if ls /etc/hedioum/* >/dev/null 2>&1 || [[ -s /etc/hedioum/config.json ]]; then
+# verify config was actually written; start the daemon only then. Otherwise
+# save the output, STOP the crash-loop, and tell the operator exactly why.
+_hed_finish() {  # <name> <setup-output>
+  local name="$1" out="$2" log="$MILI_LOGDIR/hedioum-$name.setup.log"
+  mkdir -p "$MILI_LOGDIR" 2>/dev/null || true
+  printf '%s\n' "$out" >"$log" 2>/dev/null || true
+  if _hed_configured; then
     run systemctl enable --now hedioum.service >/dev/null 2>&1 || true
+    ui_ok "hedioum configured; service started"
     return 0
   fi
-  # unknown config path but setup reported success -> try once, don't loop-enable
-  run systemctl enable hedioum.service >/dev/null 2>&1 || true
-  run systemctl start hedioum.service >/dev/null 2>&1 || true
-  return 0
+  # no config -> setup did not take. Kill the loop and explain.
+  run systemctl disable --now hedioum.service >/dev/null 2>&1 || true
+  ui_err "hedioum did NOT write a config (daemon would crash-loop) — stopped it."
+  ui_note "setup output saved to: $log"
+  ui_note "most common cause: the pairing token is wrong/expired."
+  ui_note "fix: regenerate on the foreign server, import the FRESH code here."
+  echo; ui_info "setup said:"; printf '%s\n' "$out" | tail -n 15 | sed 's/^/    /'
+  return 1
 }
 
 t_hedioum_down() {  # <name>
@@ -172,7 +183,7 @@ t_hedioum_down() {  # <name>
   st_load "$1"
   fw_remove "$1"
   if (( others == 0 )); then
-    run systemctl stop hedioum.service 2>/dev/null || true
+    run systemctl disable --now hedioum.service 2>/dev/null || true
   fi
 }
 
