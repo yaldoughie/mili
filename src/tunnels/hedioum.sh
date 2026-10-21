@@ -46,6 +46,7 @@ t_hedioum_meta() {
   echo "layer=socks"
   echo "roles=iran foreign"
   echo "primary=foreign"        # foreign generates the token
+  echo "twoway=no"              # iran only needs the token (carries foreign IP)
   echo "cores=hedioum"
 }
 

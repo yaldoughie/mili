@@ -167,10 +167,19 @@ mili_new_tunnel() {
   st_set state up; st_save
   ui_ok "tunnel '$name' created and started"
 
-  # ---- 7) pairing code (this side ALWAYS generates; peer only imports) ----
+  # ---- 7) pairing code (generator side emits ONE code carrying its own IP) ----
   if t_has "$type" pair_export; then
     echo; mili_export_code "$name"
-    echo; ui_info "Next: on the OTHER server run mili → 'Import pairing code' and paste the code above."
+    local tw; tw="$(t_meta_field "$type" twoway)"
+    echo
+    if [[ "$tw" == yes ]]; then
+      ui_info "Next steps:"
+      ui_note "1) On the OTHER server: mili → New tunnel → $(t_meta_field "$type" title) → the other side → paste this code."
+      ui_note "2) That server prints a REPLY code. Bring it back here:"
+      ui_note "   mili → 'Import pairing code' → paste the reply. Then this tunnel comes up."
+    else
+      ui_info "Next: on the OTHER server run mili → New tunnel → pick the other side → paste this code. Done."
+    fi
   else
     ui_note "This tunnel type needs no pairing."
   fi
@@ -202,23 +211,45 @@ mili_export_code() {  # <name>
 }
 
 mili_import_code() {  # [code]
-  ui_head "Import pairing / patch code"
+  ui_head "Import pairing / reply code"
   local code="${1:-}" pass=''
-  [[ -z "$code" ]] && code="$(ui_ask 'Paste pairing code' '')"
+  [[ -z "$code" ]] && code="$(ui_ask 'Paste the code' '')"
   [[ -z "$code" ]] && return 1
   [[ "$code" == mili1e:* ]] && pass="$(ui_ask_secret 'Passphrase')"
   local payload; payload="$(pair_decode "$code" "$pass")" || { ui_pause; return 1; }
-  local type name
+  local type name reply
   type="$(pair_field "$payload" type)"
   name="$(pair_field "$payload" name)"
+  reply="$(pair_field "$payload" reply)"
   [[ -z "$type" || -z "$name" ]] && { ui_err "code missing type/name"; ui_pause; return 1; }
   t_has "$type" pair_import || { ui_err "unknown tunnel type in code: $type"; ui_pause; return 1; }
+  require_root; fw_init; svc_install_templates
+
+  # ---- a REPLY code: finalize the tunnel WE generated earlier ----
+  if [[ "$reply" == 1 ]]; then
+    st_exists "$name" || { ui_err "no local tunnel '$name' to finalize (generate it here first)"; ui_pause; return 1; }
+    t_has "$type" pair_finalize || { ui_err "$type has no finalize step"; ui_pause; return 1; }
+    ui_info "finalizing tunnel '$name' with the peer's address"
+    t_call "$type" pair_finalize "$payload" || { ui_err "finalize failed"; ui_pause; return 1; }
+    ui_ok "tunnel '$name' is now fully paired and up"
+    ui_pause; return 0
+  fi
+
+  # ---- a normal pairing code: configure THIS (second) side ----
   ui_info "importing $type tunnel '$name'"
-  require_root
-  fw_init
-  svc_install_templates
   t_call "$type" pair_import "$payload" || { ui_err "import failed"; ui_pause; return 1; }
   ui_ok "imported tunnel '$name'"
+
+  # two-way tunnels: hand back a reply code carrying this side's address
+  local tw; tw="$(t_meta_field "$type" twoway)"
+  if [[ "$tw" == yes ]] && t_has "$type" pair_reply; then
+    echo; ui_head "REPLY code — paste this on the FIRST server"
+    ui_note "That server is waiting for it (mili → Import pairing code)."
+    echo
+    local rp; rp="$(t_call "$type" pair_reply "$name" | pair_encode "")"
+    printf '%s%s%s\n' "${C_YEL:-}" "$rp" "${C_RST:-}"
+    if sys_has qrencode && [[ -t 1 ]]; then echo; qrencode -t ANSIUTF8 "$rp" 2>/dev/null || true; fi
+  fi
   ui_pause
 }
 

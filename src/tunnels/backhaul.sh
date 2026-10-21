@@ -18,18 +18,17 @@ t_backhaul_meta() {
   echo "tier=free"
   echo "layer=fwd"
   echo "roles=iran foreign"
+  echo "primary=iran"     # iran = server (listener) generates; foreign dials in
+  echo "twoway=no"        # foreign only needs iran's IP (carried in the code)
   echo "cores=backhaul"
 }
 
-t_backhaul_wizard() {  # <role> <level>
+t_backhaul_wizard() {  # <role> <level>  (runs on iran = the listener/generator)
   local role="$1" level="$2"
-  if [[ "$role" == iran ]]; then
-    ST[tunnel_port]="$(ui_ask 'Public tunnel port (Iran listens)' "${ST[tunnel_port]:-$(ports_alloc_public)}")"
-    ST[my_ip]="$(ui_ask 'This Iran server public IP' "$(sys_public_ip4)")"
-  else
-    ST[iran_ip]="$(ui_ask 'Iran server public IP' "${ST[iran_ip]:-}")"
-    ST[tunnel_port]="$(ui_ask 'Tunnel port on Iran' "${ST[tunnel_port]:-}")"
-  fi
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This Iran server public IP (auto-detected)' "${ST[my_ip]}")"
+  ui_ok "this Iran server's public IP: ${ST[my_ip]}  (foreign will dial it)"
+  ST[tunnel_port]="$(ui_ask 'Public tunnel port (Iran listens)' "${ST[tunnel_port]:-$(ports_alloc_public)}")"
   [[ -z "${ST[token]:-}" ]] && ST[token]="$(sys_rand_token 24)"
 
   echo; ui_info "transport: tcp tcpmux ws wss wsmux wssmux udp"

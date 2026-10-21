@@ -135,10 +135,16 @@ counts come from stored state and the public IP is fetched once and cached.
   Cores (binaries)      Update · Uninstall · Exit
 ```
 
-**Pairing model:** you set up **one** server (Iran *or* Foreign) via *New
-tunnel* — it configures that side and prints **one** pairing code. On the other
-server you only run *Import pairing code* and paste it; it auto-configures the
-matching side. One code, one direction, no duplicate setup.
+**Pairing model (servers find each other automatically — no typing IPs):**
+The side that **listens** generates the code and auto-embeds **its own public
+IP**; the other side pastes it and dials back automatically.
+
+- **Backhaul / FRP** → set up on **Iran** (it listens) → one code → paste on Foreign. Done.
+- **paqet / Hedioum** → set up on **Foreign** (it listens) → one code → paste on Iran. Done.
+- **GRE / GRE+FRP** need *both* public IPs, so they use a two-step handshake:
+  set up on **Iran** → code → paste on **Foreign** → Foreign prints a **reply
+  code** → paste that back on Iran (*Import pairing code*). Link comes up. Still
+  zero manual IP entry — each side auto-detects its own address.
 
 CLI mirror:
 

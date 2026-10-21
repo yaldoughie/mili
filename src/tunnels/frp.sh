@@ -18,18 +18,17 @@ t_frp_meta() {
   echo "tier=free"
   echo "layer=fwd"
   echo "roles=iran foreign"
+  echo "primary=iran"     # iran = frps (listener) generates; foreign dials in
+  echo "twoway=no"
   echo "cores=frp"
 }
 
-t_frp_wizard() {  # <role> <level>
+t_frp_wizard() {  # <role> <level>  (runs on iran = frps/listener/generator)
   local role="$1" level="$2"
-  if [[ "$role" == iran ]]; then
-    ST[bind_port]="$(ui_ask 'frps public bind port (Iran)' "${ST[bind_port]:-$(ports_alloc_public)}")"
-    ST[my_ip]="$(ui_ask "This Iran server public IP" "$(sys_public_ip4)")"
-  else
-    ST[iran_ip]="$(ui_ask 'Iran server public IP' "${ST[iran_ip]:-}")"
-    ST[bind_port]="$(ui_ask 'frps bind port on Iran' "${ST[bind_port]:-}")"
-  fi
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This Iran server public IP (auto-detected)' "${ST[my_ip]}")"
+  ui_ok "this Iran server's public IP: ${ST[my_ip]}  (foreign will dial it)"
+  ST[bind_port]="$(ui_ask 'frps public bind port (Iran)' "${ST[bind_port]:-$(ports_alloc_public)}")"
   [[ -z "${ST[token]:-}" ]] && ST[token]="$(sys_rand_token 24)"
 
   echo; ui_info "Usage mode:"

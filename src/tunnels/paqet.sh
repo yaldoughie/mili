@@ -21,6 +21,8 @@ t_paqet_meta() {
   echo "tier=free"
   echo "layer=socks"
   echo "roles=iran foreign"
+  echo "primary=foreign"   # foreign = server (listener) generates; iran dials in
+  echo "twoway=no"
   echo "cores=paqet"
 }
 
@@ -34,15 +36,12 @@ _paqet_guard_port() {  # refuse kernel/x-ui/reserved ports for the raw listener
 
 t_paqet_wizard() {  # <role> <level>
   local role="$1" level="$2"
-  if [[ "$role" == foreign ]]; then
-    ST[listen_port]="$(ui_ask 'paqet listen port (foreign, raw)' "${ST[listen_port]:-$(sys_rand_port 20000 29999)}")"
-    _paqet_guard_port "${ST[listen_port]}" || { ui_err "that port is reserved / used by x-ui; pick another"; return 1; }
-    ST[my_ip]="$(ui_ask 'This foreign server public IP' "$(sys_public_ip4)")"
-  else
-    ST[foreign_ip]="$(ui_ask 'Foreign server public IP' "${ST[foreign_ip]:-}")"
-    ST[listen_port]="$(ui_ask 'paqet port on foreign' "${ST[listen_port]:-}")"
-    ST[socks_port]="${ST[socks_port]:-$(ports_alloc_socks)}"
-  fi
+  # generator = foreign (server/listener); iran side is created by import
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This foreign server public IP (auto-detected)' "${ST[my_ip]}")"
+  ui_ok "this foreign server's public IP: ${ST[my_ip]}  (iran will dial it)"
+  ST[listen_port]="$(ui_ask 'paqet listen port (foreign, raw)' "${ST[listen_port]:-$(sys_rand_port 20000 29999)}")"
+  _paqet_guard_port "${ST[listen_port]}" || { ui_err "that port is reserved / used by x-ui; pick another"; return 1; }
   [[ -z "${ST[secret]:-}" ]] && ST[secret]="$(sys_rand_hex 16)"
 
   # auto network facts (client side needs iface / local ip / router mac)

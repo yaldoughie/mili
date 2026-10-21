@@ -1810,18 +1810,17 @@ t_backhaul_meta() {
   echo "tier=free"
   echo "layer=fwd"
   echo "roles=iran foreign"
+  echo "primary=iran"     # iran = server (listener) generates; foreign dials in
+  echo "twoway=no"        # foreign only needs iran's IP (carried in the code)
   echo "cores=backhaul"
 }
 
-t_backhaul_wizard() {  # <role> <level>
+t_backhaul_wizard() {  # <role> <level>  (runs on iran = the listener/generator)
   local role="$1" level="$2"
-  if [[ "$role" == iran ]]; then
-    ST[tunnel_port]="$(ui_ask 'Public tunnel port (Iran listens)' "${ST[tunnel_port]:-$(ports_alloc_public)}")"
-    ST[my_ip]="$(ui_ask 'This Iran server public IP' "$(sys_public_ip4)")"
-  else
-    ST[iran_ip]="$(ui_ask 'Iran server public IP' "${ST[iran_ip]:-}")"
-    ST[tunnel_port]="$(ui_ask 'Tunnel port on Iran' "${ST[tunnel_port]:-}")"
-  fi
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This Iran server public IP (auto-detected)' "${ST[my_ip]}")"
+  ui_ok "this Iran server's public IP: ${ST[my_ip]}  (foreign will dial it)"
+  ST[tunnel_port]="$(ui_ask 'Public tunnel port (Iran listens)' "${ST[tunnel_port]:-$(ports_alloc_public)}")"
   [[ -z "${ST[token]:-}" ]] && ST[token]="$(sys_rand_token 24)"
 
   echo; ui_info "transport: tcp tcpmux ws wss wsmux wssmux udp"
@@ -2088,18 +2087,17 @@ t_frp_meta() {
   echo "tier=free"
   echo "layer=fwd"
   echo "roles=iran foreign"
+  echo "primary=iran"     # iran = frps (listener) generates; foreign dials in
+  echo "twoway=no"
   echo "cores=frp"
 }
 
-t_frp_wizard() {  # <role> <level>
+t_frp_wizard() {  # <role> <level>  (runs on iran = frps/listener/generator)
   local role="$1" level="$2"
-  if [[ "$role" == iran ]]; then
-    ST[bind_port]="$(ui_ask 'frps public bind port (Iran)' "${ST[bind_port]:-$(ports_alloc_public)}")"
-    ST[my_ip]="$(ui_ask "This Iran server public IP" "$(sys_public_ip4)")"
-  else
-    ST[iran_ip]="$(ui_ask 'Iran server public IP' "${ST[iran_ip]:-}")"
-    ST[bind_port]="$(ui_ask 'frps bind port on Iran' "${ST[bind_port]:-}")"
-  fi
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This Iran server public IP (auto-detected)' "${ST[my_ip]}")"
+  ui_ok "this Iran server's public IP: ${ST[my_ip]}  (foreign will dial it)"
+  ST[bind_port]="$(ui_ask 'frps public bind port (Iran)' "${ST[bind_port]:-$(ports_alloc_public)}")"
   [[ -z "${ST[token]:-}" ]] && ST[token]="$(sys_rand_token 24)"
 
   echo; ui_info "Usage mode:"
@@ -2359,6 +2357,8 @@ t_gre_meta() {
   echo "tier=free"
   echo "layer=l3"
   echo "roles=iran foreign"
+  echo "primary=iran"     # iran generates; foreign imports + replies
+  echo "twoway=yes"       # both ends need each other's IP (reply code)
   echo "cores="
 }
 
@@ -2366,11 +2366,16 @@ _gre_if()   { printf 'mgre-%s' "$1"; }
 _gre_inner_local() { local n="$1" role="$2"; [[ "$role" == iran ]] && echo "10.77.$n.1" || echo "10.77.$n.2"; }
 _gre_inner_peer()  { local n="$1" role="$2"; [[ "$role" == iran ]] && echo "10.77.$n.2" || echo "10.77.$n.1"; }
 
-t_gre_wizard() {  # <role> <level>
+t_gre_wizard() {  # <role> <level>  (runs on the GENERATOR = iran side)
   local role="$1" level="$2" n
-  ST[peer_ip]="$(ui_ask "Peer (other server) public IP" "${ST[peer_ip]:-}")"
-  sys_is_ip4 "${ST[peer_ip]}" || sys_is_host "${ST[peer_ip]}" || { ui_err "invalid peer IP/host"; return 1; }
-  ST[my_ip]="$(ui_ask "This server's public IP" "$(sys_public_ip4)")"
+  # own public IP is auto-detected; no manual entry. Peer IP arrives via the
+  # reply code (no typing). Advanced may override the detected own IP.
+  ST[my_ip]="$(sys_public_ip4)"
+  if [[ "$level" == advanced ]]; then
+    ST[my_ip]="$(ui_ask "This server's public IP (auto-detected)" "${ST[my_ip]}")"
+  fi
+  ui_ok "this server's public IP: ${ST[my_ip]}"
+  ST[peer_ip]="${ST[peer_ip]:-}"   # filled later by the peer's reply code
 
   # variant
   echo; ui_info "GRE variant:"
@@ -2503,6 +2508,12 @@ t_gre_render() { :; }   # no engine config file; all kernel state
 t_gre_up() {  # <name>
   st_load "$1"; local name="$1" unit; unit="mili-l3@$name.service"
   require_root
+  # not yet paired with the peer's address -> stay pending until the reply code
+  if [[ -z "${ST[peer_ip]:-}" ]]; then
+    ui_warn "waiting for the peer's reply code before the GRE link can come up"
+    ui_note "import the REPLY code from the other server to finish '$name'."
+    return 0
+  fi
   t_gre_fw_apply "$name"
   svc_up "$unit"
   # foreign-side SOCKS helper
@@ -2584,14 +2595,15 @@ t_gre_test() {  # <name>
   fi
 }
 
-# ---- pairing ---------------------------------------------------------------
-t_gre_pair_export() {  # <name> : emit payload for the OTHER side
+# ---- pairing (iran generates; foreign imports + replies; iran finalizes) ----
+# forward code: iran -> foreign. Carries the generator's (iran) public IP as
+# gen_ip so foreign can set its remote. foreign auto-detects its own IP.
+t_gre_pair_export() {  # <name>
   st_load "$1"
-  local peerrole; [[ "${ST[role]}" == iran ]] && peerrole=foreign || peerrole=iran
   cat <<EOF
 type=gre
 name=${ST[name]}
-role=$peerrole
+role=foreign
 variant=${ST[variant]}
 mode=${ST[mode]}
 inner_n=${ST[inner_n]}
@@ -2599,8 +2611,7 @@ key=${ST[key]}
 mtu=${ST[mtu]}
 ttl=${ST[ttl]}
 fou_port=${ST[fou_port]:-}
-my_ip=${ST[peer_ip]}
-peer_ip=${ST[my_ip]}
+gen_ip=${ST[my_ip]}
 socks_port=${ST[socks_port]:-}
 socks_user=${ST[socks_user]:-}
 socks_pass=${ST[socks_pass]:-}
@@ -2608,28 +2619,47 @@ fwd=${ST[fwd]:-}
 EOF
 }
 
-t_gre_pair_import() {  # <payload>
-  local p="$1" name role n
-  name="$(pair_field "$p" name)"; role="$(pair_field "$p" role)"
-  n="$(pair_field "$p" inner_n)"
-  ST=(); ST[name]="$name"; ST[type]=gre; ST[role]="$role"
+t_gre_pair_import() {  # <payload>  (runs on foreign)
+  local p="$1" name n
+  name="$(pair_field "$p" name)"; n="$(pair_field "$p" inner_n)"
+  ST=(); ST[name]="$name"; ST[type]=gre; ST[role]=foreign
   ST[variant]="$(pair_field "$p" variant)"; ST[mode]="$(pair_field "$p" mode)"
   ST[inner_n]="$n"; ST[key]="$(pair_field "$p" key)"
   ST[mtu]="$(pair_field "$p" mtu)"; ST[ttl]="$(pair_field "$p" ttl)"
   ST[fou_port]="$(pair_field "$p" fou_port)"
-  ST[my_ip]="$(pair_field "$p" my_ip)"; ST[peer_ip]="$(pair_field "$p" peer_ip)"
-  ST[inner_local]="$(_gre_inner_local "$n" "$role")"
-  ST[inner_peer]="$(_gre_inner_peer  "$n" "$role")"
+  ST[my_ip]="$(sys_public_ip4)"                 # foreign auto-detects its own IP
+  ST[peer_ip]="$(pair_field "$p" gen_ip)"       # peer = iran (from the code)
+  ui_ok "this server's public IP: ${ST[my_ip]}  (peer iran: ${ST[peer_ip]})"
+  ST[inner_local]="$(_gre_inner_local "$n" foreign)"
+  ST[inner_peer]="$(_gre_inner_peer  "$n" foreign)"
   ST[socks_port]="$(pair_field "$p" socks_port)"
   ST[socks_user]="$(pair_field "$p" socks_user)"
   ST[socks_pass]="$(pair_field "$p" socks_pass)"
   ST[fwd]="$(pair_field "$p" fwd)"
-  [[ "${ST[mode]}" == l3 && "$role" == iran ]] && ST[table]="$(pool_table_id)"
-  # re-check port availability on this side
-  if [[ "${ST[variant]}" == fou ]] && ports_in_use "${ST[fou_port]}"; then
-    ui_warn "fou port ${ST[fou_port]} busy here; you must remap and send a patch code"
-  fi
   pool_inner_claim "$n" "$name"
+  st_save
+  t_gre_render "$name"; t_gre_up "$name"
+  st_set state up; st_save
+}
+
+# reply code: foreign -> iran, carrying foreign's own IP so iran sets its remote
+t_gre_pair_reply() {  # <name>  (runs on foreign)
+  st_load "$1"
+  cat <<EOF
+type=gre
+name=${ST[name]}
+reply=1
+peer_ip=${ST[my_ip]}
+EOF
+}
+
+# finalize on iran: learn foreign's IP, bring the link up
+t_gre_pair_finalize() {  # <payload>  (runs on iran)
+  local p="$1" name
+  name="$(pair_field "$p" name)"
+  st_load "$name" || return 1
+  ST[peer_ip]="$(pair_field "$p" peer_ip)"
+  [[ "${ST[mode]}" == l3 && -z "${ST[table]:-}" ]] && ST[table]="$(pool_table_id)"
   st_save
   t_gre_render "$name"; t_gre_up "$name"
   st_set state up; st_save
@@ -2656,6 +2686,8 @@ t_grefrp_meta() {
   echo "tier=free"
   echo "layer=fwd"
   echo "roles=iran foreign"
+  echo "primary=iran"     # iran (frps) generates; foreign imports + replies
+  echo "twoway=yes"
   echo "cores=frp"
 }
 
@@ -2663,10 +2695,12 @@ _grf_if() { printf 'mgrf-%s' "$1"; }
 _grf_inner_local() { local n="$1" r="$2"; [[ "$r" == iran ]] && echo "10.77.$n.1" || echo "10.77.$n.2"; }
 _grf_inner_peer()  { local n="$1" r="$2"; [[ "$r" == iran ]] && echo "10.77.$n.2" || echo "10.77.$n.1"; }
 
-t_grefrp_wizard() {  # <role> <level>
+t_grefrp_wizard() {  # <role> <level>  (runs on the GENERATOR = iran side)
   local role="$1" level="$2" n
-  ST[peer_ip]="$(ui_ask "Peer public IP" "${ST[peer_ip]:-}")"
-  ST[my_ip]="$(ui_ask "This server public IP" "$(sys_public_ip4)")"
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask "This server public IP (auto-detected)" "${ST[my_ip]}")"
+  ui_ok "this server's public IP: ${ST[my_ip]}"
+  ST[peer_ip]="${ST[peer_ip]:-}"   # arrives via the reply code
 
   echo; ui_info "GRE variant: 1) gre  2) gre+fou (recommended)"
   local gv; gv="$(ui_ask 'variant' "${ST[variant]:-2}")"
@@ -2819,7 +2853,13 @@ t_grefrp_fw_apply() {  # <name>
 
 t_grefrp_up() {  # <name>
   st_load "$1"; local name="$1"
-  require_root; cores_ensure frp
+  require_root
+  if [[ -z "${ST[peer_ip]:-}" ]]; then
+    ui_warn "waiting for the peer's reply code before GRE+FRP can come up"
+    ui_note "import the REPLY code from the other server to finish '$name'."
+    return 0
+  fi
+  cores_ensure frp
   t_grefrp_fw_apply "$name"
   svc_up "mili-l3@$name.service"       # brings GRE iface up (via _l3 -> ifup)
   t_grefrp_render "$name"
@@ -2895,13 +2935,12 @@ t_grefrp_test() {
   [[ "${ST[mode]}" == socks && "${ST[role]}" == iran ]] && doctor_socks 127.0.0.1 "${ST[remote_port]}" "${ST[socks_user]}" "${ST[socks_pass]}"
 }
 
-t_grefrp_pair_export() {
+t_grefrp_pair_export() {  # iran -> foreign
   st_load "$1"
-  local peerrole; [[ "${ST[role]}" == iran ]] && peerrole=foreign || peerrole=iran
   cat <<EOF
 type=grefrp
 name=${ST[name]}
-role=$peerrole
+role=foreign
 variant=${ST[variant]}
 mode=${ST[mode]}
 inner_n=${ST[inner_n]}
@@ -2909,8 +2948,7 @@ key=${ST[key]}
 mtu=${ST[mtu]}
 ttl=${ST[ttl]}
 fou_port=${ST[fou_port]:-}
-my_ip=${ST[peer_ip]}
-peer_ip=${ST[my_ip]}
+gen_ip=${ST[my_ip]}
 bind_port=${ST[bind_port]}
 token=${ST[token]}
 transport=${ST[transport]}
@@ -2922,23 +2960,44 @@ fwd=${ST[fwd]:-}
 EOF
 }
 
-t_grefrp_pair_import() {
-  local p="$1" name role n
-  name="$(pair_field "$p" name)"; role="$(pair_field "$p" role)"; n="$(pair_field "$p" inner_n)"
-  ST=(); ST[name]="$name"; ST[type]=grefrp; ST[role]="$role"
+t_grefrp_pair_import() {  # runs on foreign
+  local p="$1" name n
+  name="$(pair_field "$p" name)"; n="$(pair_field "$p" inner_n)"
+  ST=(); ST[name]="$name"; ST[type]=grefrp; ST[role]=foreign
   ST[variant]="$(pair_field "$p" variant)"; ST[mode]="$(pair_field "$p" mode)"
   ST[inner_n]="$n"; ST[key]="$(pair_field "$p" key)"
   ST[mtu]="$(pair_field "$p" mtu)"; ST[ttl]="$(pair_field "$p" ttl)"
   ST[fou_port]="$(pair_field "$p" fou_port)"
-  ST[my_ip]="$(pair_field "$p" my_ip)"; ST[peer_ip]="$(pair_field "$p" peer_ip)"
-  ST[inner_local]="$(_grf_inner_local "$n" "$role")"
-  ST[inner_peer]="$(_grf_inner_peer  "$n" "$role")"
+  ST[my_ip]="$(sys_public_ip4)"
+  ST[peer_ip]="$(pair_field "$p" gen_ip)"
+  ui_ok "this server's public IP: ${ST[my_ip]}  (peer iran: ${ST[peer_ip]})"
+  ST[inner_local]="$(_grf_inner_local "$n" foreign)"
+  ST[inner_peer]="$(_grf_inner_peer  "$n" foreign)"
   ST[bind_port]="$(pair_field "$p" bind_port)"; ST[token]="$(pair_field "$p" token)"
   ST[transport]="$(pair_field "$p" transport)"; ST[tls]="$(pair_field "$p" tls)"
   ST[remote_port]="$(pair_field "$p" remote_port)"
   ST[socks_user]="$(pair_field "$p" socks_user)"; ST[socks_pass]="$(pair_field "$p" socks_pass)"
   ST[fwd]="$(pair_field "$p" fwd)"
   pool_inner_claim "$n" "$name"
+  st_save
+  t_grefrp_up "$name"; st_set state up; st_save
+}
+
+t_grefrp_pair_reply() {  # foreign -> iran
+  st_load "$1"
+  cat <<EOF
+type=grefrp
+name=${ST[name]}
+reply=1
+peer_ip=${ST[my_ip]}
+EOF
+}
+
+t_grefrp_pair_finalize() {  # runs on iran
+  local p="$1" name
+  name="$(pair_field "$p" name)"
+  st_load "$name" || return 1
+  ST[peer_ip]="$(pair_field "$p" peer_ip)"
   st_save
   t_grefrp_up "$name"; st_set state up; st_save
 }
@@ -2992,6 +3051,7 @@ t_hedioum_meta() {
   echo "layer=socks"
   echo "roles=iran foreign"
   echo "primary=foreign"        # foreign generates the token
+  echo "twoway=no"              # iran only needs the token (carries foreign IP)
   echo "cores=hedioum"
 }
 
@@ -3183,6 +3243,8 @@ t_paqet_meta() {
   echo "tier=free"
   echo "layer=socks"
   echo "roles=iran foreign"
+  echo "primary=foreign"   # foreign = server (listener) generates; iran dials in
+  echo "twoway=no"
   echo "cores=paqet"
 }
 
@@ -3196,15 +3258,12 @@ _paqet_guard_port() {  # refuse kernel/x-ui/reserved ports for the raw listener
 
 t_paqet_wizard() {  # <role> <level>
   local role="$1" level="$2"
-  if [[ "$role" == foreign ]]; then
-    ST[listen_port]="$(ui_ask 'paqet listen port (foreign, raw)' "${ST[listen_port]:-$(sys_rand_port 20000 29999)}")"
-    _paqet_guard_port "${ST[listen_port]}" || { ui_err "that port is reserved / used by x-ui; pick another"; return 1; }
-    ST[my_ip]="$(ui_ask 'This foreign server public IP' "$(sys_public_ip4)")"
-  else
-    ST[foreign_ip]="$(ui_ask 'Foreign server public IP' "${ST[foreign_ip]:-}")"
-    ST[listen_port]="$(ui_ask 'paqet port on foreign' "${ST[listen_port]:-}")"
-    ST[socks_port]="${ST[socks_port]:-$(ports_alloc_socks)}"
-  fi
+  # generator = foreign (server/listener); iran side is created by import
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask 'This foreign server public IP (auto-detected)' "${ST[my_ip]}")"
+  ui_ok "this foreign server's public IP: ${ST[my_ip]}  (iran will dial it)"
+  ST[listen_port]="$(ui_ask 'paqet listen port (foreign, raw)' "${ST[listen_port]:-$(sys_rand_port 20000 29999)}")"
+  _paqet_guard_port "${ST[listen_port]}" || { ui_err "that port is reserved / used by x-ui; pick another"; return 1; }
   [[ -z "${ST[secret]:-}" ]] && ST[secret]="$(sys_rand_hex 16)"
 
   # auto network facts (client side needs iface / local ip / router mac)
@@ -3546,10 +3605,19 @@ mili_new_tunnel() {
   st_set state up; st_save
   ui_ok "tunnel '$name' created and started"
 
-  # ---- 7) pairing code (this side ALWAYS generates; peer only imports) ----
+  # ---- 7) pairing code (generator side emits ONE code carrying its own IP) ----
   if t_has "$type" pair_export; then
     echo; mili_export_code "$name"
-    echo; ui_info "Next: on the OTHER server run mili → 'Import pairing code' and paste the code above."
+    local tw; tw="$(t_meta_field "$type" twoway)"
+    echo
+    if [[ "$tw" == yes ]]; then
+      ui_info "Next steps:"
+      ui_note "1) On the OTHER server: mili → New tunnel → $(t_meta_field "$type" title) → the other side → paste this code."
+      ui_note "2) That server prints a REPLY code. Bring it back here:"
+      ui_note "   mili → 'Import pairing code' → paste the reply. Then this tunnel comes up."
+    else
+      ui_info "Next: on the OTHER server run mili → New tunnel → pick the other side → paste this code. Done."
+    fi
   else
     ui_note "This tunnel type needs no pairing."
   fi
@@ -3581,23 +3649,45 @@ mili_export_code() {  # <name>
 }
 
 mili_import_code() {  # [code]
-  ui_head "Import pairing / patch code"
+  ui_head "Import pairing / reply code"
   local code="${1:-}" pass=''
-  [[ -z "$code" ]] && code="$(ui_ask 'Paste pairing code' '')"
+  [[ -z "$code" ]] && code="$(ui_ask 'Paste the code' '')"
   [[ -z "$code" ]] && return 1
   [[ "$code" == mili1e:* ]] && pass="$(ui_ask_secret 'Passphrase')"
   local payload; payload="$(pair_decode "$code" "$pass")" || { ui_pause; return 1; }
-  local type name
+  local type name reply
   type="$(pair_field "$payload" type)"
   name="$(pair_field "$payload" name)"
+  reply="$(pair_field "$payload" reply)"
   [[ -z "$type" || -z "$name" ]] && { ui_err "code missing type/name"; ui_pause; return 1; }
   t_has "$type" pair_import || { ui_err "unknown tunnel type in code: $type"; ui_pause; return 1; }
+  require_root; fw_init; svc_install_templates
+
+  # ---- a REPLY code: finalize the tunnel WE generated earlier ----
+  if [[ "$reply" == 1 ]]; then
+    st_exists "$name" || { ui_err "no local tunnel '$name' to finalize (generate it here first)"; ui_pause; return 1; }
+    t_has "$type" pair_finalize || { ui_err "$type has no finalize step"; ui_pause; return 1; }
+    ui_info "finalizing tunnel '$name' with the peer's address"
+    t_call "$type" pair_finalize "$payload" || { ui_err "finalize failed"; ui_pause; return 1; }
+    ui_ok "tunnel '$name' is now fully paired and up"
+    ui_pause; return 0
+  fi
+
+  # ---- a normal pairing code: configure THIS (second) side ----
   ui_info "importing $type tunnel '$name'"
-  require_root
-  fw_init
-  svc_install_templates
   t_call "$type" pair_import "$payload" || { ui_err "import failed"; ui_pause; return 1; }
   ui_ok "imported tunnel '$name'"
+
+  # two-way tunnels: hand back a reply code carrying this side's address
+  local tw; tw="$(t_meta_field "$type" twoway)"
+  if [[ "$tw" == yes ]] && t_has "$type" pair_reply; then
+    echo; ui_head "REPLY code — paste this on the FIRST server"
+    ui_note "That server is waiting for it (mili → Import pairing code)."
+    echo
+    local rp; rp="$(t_call "$type" pair_reply "$name" | pair_encode "")"
+    printf '%s%s%s\n' "${C_YEL:-}" "$rp" "${C_RST:-}"
+    if sys_has qrencode && [[ -t 1 ]]; then echo; qrencode -t ANSIUTF8 "$rp" 2>/dev/null || true; fi
+  fi
   ui_pause
 }
 

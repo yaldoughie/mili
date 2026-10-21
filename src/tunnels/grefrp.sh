@@ -18,6 +18,8 @@ t_grefrp_meta() {
   echo "tier=free"
   echo "layer=fwd"
   echo "roles=iran foreign"
+  echo "primary=iran"     # iran (frps) generates; foreign imports + replies
+  echo "twoway=yes"
   echo "cores=frp"
 }
 
@@ -25,10 +27,12 @@ _grf_if() { printf 'mgrf-%s' "$1"; }
 _grf_inner_local() { local n="$1" r="$2"; [[ "$r" == iran ]] && echo "10.77.$n.1" || echo "10.77.$n.2"; }
 _grf_inner_peer()  { local n="$1" r="$2"; [[ "$r" == iran ]] && echo "10.77.$n.2" || echo "10.77.$n.1"; }
 
-t_grefrp_wizard() {  # <role> <level>
+t_grefrp_wizard() {  # <role> <level>  (runs on the GENERATOR = iran side)
   local role="$1" level="$2" n
-  ST[peer_ip]="$(ui_ask "Peer public IP" "${ST[peer_ip]:-}")"
-  ST[my_ip]="$(ui_ask "This server public IP" "$(sys_public_ip4)")"
+  ST[my_ip]="$(sys_public_ip4)"
+  [[ "$level" == advanced ]] && ST[my_ip]="$(ui_ask "This server public IP (auto-detected)" "${ST[my_ip]}")"
+  ui_ok "this server's public IP: ${ST[my_ip]}"
+  ST[peer_ip]="${ST[peer_ip]:-}"   # arrives via the reply code
 
   echo; ui_info "GRE variant: 1) gre  2) gre+fou (recommended)"
   local gv; gv="$(ui_ask 'variant' "${ST[variant]:-2}")"
@@ -181,7 +185,13 @@ t_grefrp_fw_apply() {  # <name>
 
 t_grefrp_up() {  # <name>
   st_load "$1"; local name="$1"
-  require_root; cores_ensure frp
+  require_root
+  if [[ -z "${ST[peer_ip]:-}" ]]; then
+    ui_warn "waiting for the peer's reply code before GRE+FRP can come up"
+    ui_note "import the REPLY code from the other server to finish '$name'."
+    return 0
+  fi
+  cores_ensure frp
   t_grefrp_fw_apply "$name"
   svc_up "mili-l3@$name.service"       # brings GRE iface up (via _l3 -> ifup)
   t_grefrp_render "$name"
@@ -257,13 +267,12 @@ t_grefrp_test() {
   [[ "${ST[mode]}" == socks && "${ST[role]}" == iran ]] && doctor_socks 127.0.0.1 "${ST[remote_port]}" "${ST[socks_user]}" "${ST[socks_pass]}"
 }
 
-t_grefrp_pair_export() {
+t_grefrp_pair_export() {  # iran -> foreign
   st_load "$1"
-  local peerrole; [[ "${ST[role]}" == iran ]] && peerrole=foreign || peerrole=iran
   cat <<EOF
 type=grefrp
 name=${ST[name]}
-role=$peerrole
+role=foreign
 variant=${ST[variant]}
 mode=${ST[mode]}
 inner_n=${ST[inner_n]}
@@ -271,8 +280,7 @@ key=${ST[key]}
 mtu=${ST[mtu]}
 ttl=${ST[ttl]}
 fou_port=${ST[fou_port]:-}
-my_ip=${ST[peer_ip]}
-peer_ip=${ST[my_ip]}
+gen_ip=${ST[my_ip]}
 bind_port=${ST[bind_port]}
 token=${ST[token]}
 transport=${ST[transport]}
@@ -284,23 +292,44 @@ fwd=${ST[fwd]:-}
 EOF
 }
 
-t_grefrp_pair_import() {
-  local p="$1" name role n
-  name="$(pair_field "$p" name)"; role="$(pair_field "$p" role)"; n="$(pair_field "$p" inner_n)"
-  ST=(); ST[name]="$name"; ST[type]=grefrp; ST[role]="$role"
+t_grefrp_pair_import() {  # runs on foreign
+  local p="$1" name n
+  name="$(pair_field "$p" name)"; n="$(pair_field "$p" inner_n)"
+  ST=(); ST[name]="$name"; ST[type]=grefrp; ST[role]=foreign
   ST[variant]="$(pair_field "$p" variant)"; ST[mode]="$(pair_field "$p" mode)"
   ST[inner_n]="$n"; ST[key]="$(pair_field "$p" key)"
   ST[mtu]="$(pair_field "$p" mtu)"; ST[ttl]="$(pair_field "$p" ttl)"
   ST[fou_port]="$(pair_field "$p" fou_port)"
-  ST[my_ip]="$(pair_field "$p" my_ip)"; ST[peer_ip]="$(pair_field "$p" peer_ip)"
-  ST[inner_local]="$(_grf_inner_local "$n" "$role")"
-  ST[inner_peer]="$(_grf_inner_peer  "$n" "$role")"
+  ST[my_ip]="$(sys_public_ip4)"
+  ST[peer_ip]="$(pair_field "$p" gen_ip)"
+  ui_ok "this server's public IP: ${ST[my_ip]}  (peer iran: ${ST[peer_ip]})"
+  ST[inner_local]="$(_grf_inner_local "$n" foreign)"
+  ST[inner_peer]="$(_grf_inner_peer  "$n" foreign)"
   ST[bind_port]="$(pair_field "$p" bind_port)"; ST[token]="$(pair_field "$p" token)"
   ST[transport]="$(pair_field "$p" transport)"; ST[tls]="$(pair_field "$p" tls)"
   ST[remote_port]="$(pair_field "$p" remote_port)"
   ST[socks_user]="$(pair_field "$p" socks_user)"; ST[socks_pass]="$(pair_field "$p" socks_pass)"
   ST[fwd]="$(pair_field "$p" fwd)"
   pool_inner_claim "$n" "$name"
+  st_save
+  t_grefrp_up "$name"; st_set state up; st_save
+}
+
+t_grefrp_pair_reply() {  # foreign -> iran
+  st_load "$1"
+  cat <<EOF
+type=grefrp
+name=${ST[name]}
+reply=1
+peer_ip=${ST[my_ip]}
+EOF
+}
+
+t_grefrp_pair_finalize() {  # runs on iran
+  local p="$1" name
+  name="$(pair_field "$p" name)"
+  st_load "$name" || return 1
+  ST[peer_ip]="$(pair_field "$p" peer_ip)"
   st_save
   t_grefrp_up "$name"; st_set state up; st_save
 }
