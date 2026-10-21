@@ -124,6 +124,71 @@ ui_item() {
   fi
 }
 
+# ============================================================================
+# arrow-key selector (live pointer, up/down + Enter). Returns 1-based index in
+# global SEL (0 = cancelled). Items may embed a hint as "label\thint".
+# Falls back to a numbered prompt when stdin/stdout is not a TTY or NO_COLOR.
+# ============================================================================
+declare -ga UISEL_ITEMS=()
+UISEL_SEL=0
+
+_ui_sel_row() {  # <index>
+  local i="$1" raw="${UISEL_ITEMS[$1]}" label hint
+  label="${raw%%$'\t'*}"; hint=''
+  [[ "$raw" == *$'\t'* ]] && hint="${raw#*$'\t'}"
+  if (( i == UISEL_SEL )); then
+    printf '\e[2K   %s%s %s%-30s%s%s%s%s\n' \
+      "$C_B$C_CYN" "▶" "$C_B$C_WHT" "$label" "$C_RST" \
+      "${hint:+  $C_CYN}" "$hint" "$C_RST"
+  else
+    printf '\e[2K     %s%-30s%s%s%s%s\n' \
+      "$C_WHT" "$label" "$C_RST" "${hint:+  $C_GRY}" "$hint" "$C_RST"
+  fi
+}
+
+_ui_sel_render() { local i; for i in "${!UISEL_ITEMS[@]}"; do _ui_sel_row "$i"; done; }
+
+# ui_select <preselect-index> <item> [item...]   -> sets SEL (1-based; 0=cancel)
+ui_select() {
+  local pre="${1:-0}"; shift
+  UISEL_ITEMS=("$@"); UISEL_SEL="$pre"
+  local n=${#UISEL_ITEMS[@]} key esc
+  (( n == 0 )) && { SEL=0; return; }
+  (( UISEL_SEL < 0 || UISEL_SEL >= n )) && UISEL_SEL=0
+
+  # fallback: no TTY / no color -> numbered prompt
+  if [[ ! -t 0 || ! -t 1 || "$MILI_COLORMODE" == none ]]; then
+    local i; for i in "${!UISEL_ITEMS[@]}"; do
+      printf '   %s%2d%s) %s\n' "$C_B$C_CYN" $((i+1)) "$C_RST" "${UISEL_ITEMS[$i]%%$'\t'*}"
+    done
+    local pick; read -r -p "$(printf '%s>%s ' "$C_CYN" "$C_RST")" pick || true
+    [[ "$pick" =~ ^[0-9]+$ ]] && SEL="$pick" || SEL=0
+    return
+  fi
+
+  tput civis 2>/dev/null || true
+  _ui_sel_render
+  while :; do
+    IFS= read -rsn1 key 2>/dev/null || { SEL=0; break; }
+    case "$key" in
+      $'\x1b') read -rsn2 -t 0.05 esc 2>/dev/null
+               case "$esc" in
+                 '[A'|'OA') (( UISEL_SEL = (UISEL_SEL - 1 + n) % n )) ;;
+                 '[B'|'OB') (( UISEL_SEL = (UISEL_SEL + 1) % n )) ;;
+                 '') SEL=0; break ;;   # bare ESC = cancel
+               esac ;;
+      ''|$'\n'|$'\r') SEL=$(( UISEL_SEL + 1 )); break ;;
+      k|K) (( UISEL_SEL = (UISEL_SEL - 1 + n) % n )) ;;
+      j|J) (( UISEL_SEL = (UISEL_SEL + 1) % n )) ;;
+      q|Q) SEL=0; break ;;
+      [1-9]) (( key >= 1 && key <= n )) && UISEL_SEL=$(( key - 1 )) ;;
+    esac
+    printf '\e[%dA' "$n"   # move back to top of list
+    _ui_sel_render
+  done
+  tput cnorm 2>/dev/null || true
+}
+
 # ---- prompts ---------------------------------------------------------------
 # ask <prompt> <default> -> echoes answer
 ui_ask() {
@@ -306,26 +371,23 @@ sys_local_ip4() {
   ip -4 addr show dev "$ifc" 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}'
 }
 
-# public IP via several resolvers (no single point of failure); cached per run
+# public IP; cached for the whole run (first call ~1-2s max, rest instant).
+# Tries the fast local route hint first, then two quick HTTP resolvers.
 sys_public_ip4() {
   [[ -n "${MILI_PUBIP4:-}" ]] && { printf '%s' "$MILI_PUBIP4"; return 0; }
-  local urls=(https://api.ipify.org https://ifconfig.me/ip https://ipv4.icanhazip.com)
-  local u ip
+  local urls=(https://api.ipify.org https://ipv4.icanhazip.com) u ip
   for u in "${urls[@]}"; do
-    ip=$(curl -4 -fsS --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')
+    ip=$(curl -4 -fsS --connect-timeout 2 --max-time 3 "$u" 2>/dev/null | tr -d '[:space:]')
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { MILI_PUBIP4="$ip"; printf '%s' "$ip"; return 0; }
   done
-  ip="$(sys_local_ip4)"; MILI_PUBIP4="$ip"; printf '%s' "$ip"
+  ip="$(sys_local_ip4)"; MILI_PUBIP4="${ip:-unknown}"; printf '%s' "$MILI_PUBIP4"
 }
+# IPv6 is opt-in / lazy: single quick probe, cached. Empty if none.
 sys_public_ip6() {
-  [[ -n "${MILI_PUBIP6:-}" ]] && { printf '%s' "$MILI_PUBIP6"; return 0; }
-  local urls=(https://api6.ipify.org https://ipv6.icanhazip.com)
-  local u ip
-  for u in "${urls[@]}"; do
-    ip=$(curl -6 -fsS --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')
-    [[ "$ip" == *:* ]] && { MILI_PUBIP6="$ip"; printf '%s' "$ip"; return 0; }
-  done
-  return 1
+  [[ -n "${MILI_PUBIP6:-}" ]] && { printf '%s' "$MILI_PUBIP6"; [[ "$MILI_PUBIP6" == none ]] && return 1 || return 0; }
+  local ip; ip=$(curl -6 -fsS --connect-timeout 2 --max-time 3 https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]')
+  if [[ "$ip" == *:* ]]; then MILI_PUBIP6="$ip"; printf '%s' "$ip"; return 0; fi
+  MILI_PUBIP6=none; return 1
 }
 
 # validate an IPv4 literal
@@ -3404,34 +3466,55 @@ mili_delete() {  # <name>
 # ============================================================================
 # new tunnel wizard (generic driver; per-type wizard fills ST)
 # ============================================================================
+# role descriptions per tunnel (what each side does)
+_role_hint() {  # <type> <role>
+  local role="$2"
+  case "$2" in
+    iran)    printf 'Iran server — entry, sits next to 3x-ui (users connect here)' ;;
+    foreign) printf 'Foreign server — exit/egress abroad' ;;
+    *)       printf '%s' "$role" ;;
+  esac
+}
+
 mili_new_tunnel() {
   ui_clear; ui_head "New tunnel"
-  # type list - priority first
+  ui_note "You configure THIS server here. It produces ONE pairing code."
+  ui_note "On the OTHER server, run mili → 'Import pairing code' and paste it."
+  echo
+
+  # ---- 1) tunnel type (arrow) ----
   local -a order=(gre grefrp backhaul paqet hedioum frp "${MILI_TYPES[@]}")
-  # dedupe preserving order, keep only registered types
-  local -a types=(); local t seen=''
+  local -a types=() labels=(); local t seen='' title tier badge star
   for t in "${order[@]}"; do
     [[ " $seen " == *" $t "* ]] && continue
     declare -F "t_${t}_meta" >/dev/null 2>&1 || continue
     types+=("$t"); seen="$seen $t"
-  done
-  local i=1 star title tier
-  for t in "${types[@]}"; do
     title="$(t_meta_field "$t" title)"; tier="$(t_meta_field "$t" tier)"
-    star=''; case "$t" in gre|grefrp|backhaul|paqet|hedioum) star=1;; esac
-    local badge=''; [[ "$tier" == premium ]] && badge="(premium)"
-    ui_item "$i" "$title" "$badge" "$star"
-    ((i++))
+    star=''; case "$t" in gre|grefrp|backhaul|paqet|hedioum) star='★ ';; esac
+    badge=''; [[ "$tier" == premium ]] && badge='premium'
+    labels+=("$star$title"$'\t'"$badge")
   done
-  ui_item 0 "Cancel"
-  local pick; pick="$(ui_ask 'Choose tunnel type' '')"
-  [[ "$pick" == 0 || -z "$pick" ]] && return 0
-  (( pick>=1 && pick<=${#types[@]} )) || { ui_err "invalid choice"; ui_pause; return 1; }
-  local type="${types[$((pick-1))]}"
-
+  labels+=("Cancel"$'\t')
+  ui_select 0 "${labels[@]}"
+  (( SEL==0 || SEL > ${#types[@]} )) && return 0
+  local type="${types[$((SEL-1))]}"
   feature_gate "tunnel.$type" || { ui_pause; return 1; }
 
-  # name
+  # ---- 2) which server is THIS one (arrow) ----
+  local roles; roles="$(t_meta_field "$type" roles)"; roles="${roles:-iran foreign}"
+  local -a rarr=($roles) rlabels=()
+  local r pre=0 idx=0
+  for r in "${rarr[@]}"; do
+    rlabels+=("$(printf '%s' "${r^}")"$'\t'"$(_role_hint "$type" "$r")")
+    [[ "$r" == "${MILI_DEFAULT_ROLE:-}" ]] && pre=$idx
+    ((idx++))
+  done
+  echo; ui_info "Which server is this?"
+  ui_select "$pre" "${rlabels[@]}"
+  (( SEL==0 )) && return 0
+  local role="${rarr[$((SEL-1))]}"
+
+  # ---- 3) name ----
   local name
   while :; do
     name="$(ui_ask 'Tunnel name (a-z0-9, max 10)' "$type$(sys_rand_hex 1)")"
@@ -3440,31 +3523,25 @@ mili_new_tunnel() {
     break
   done
 
-  # role
-  local roles role
-  roles="$(t_meta_field "$type" roles)"; roles="${roles:-iran foreign}"
-  ui_info "roles for $type: $roles"
-  role="$(ui_ask "This server's role [$roles]" "${MILI_DEFAULT_ROLE:-${roles%% *}}")"
+  # ---- 4) basic/advanced (arrow) ----
+  echo; ui_info "Option detail:"
+  ui_select 0 $'Basic\trecommended defaults, fewest questions' $'Advanced\texpose transport / tuning knobs'
+  local level=basic; [[ "$SEL" == 2 ]] && level=advanced
 
-  # advanced?
-  local level=basic
-  ui_confirm "Show advanced options?" n && level=advanced
-
-  # init record
+  # ---- 5) role-specific wizard ----
   ST=(); ST[name]="$name"; ST[type]="$type"; ST[role]="$role"; ST[created]="$(date -Iseconds 2>/dev/null || date)"
+  echo; ui_head "Configure $(t_meta_field "$type" title) — $(printf '%s' "${role^}") side"
+  t_call "$type" wizard "$role" "$level" || { ui_err "wizard aborted"; ui_pause; return 1; }
 
-  # per-type wizard fills ST (ports, mode, secrets, peer info...)
-  t_call "$type" wizard "$role" "$level" || { ui_err "wizard aborted"; return 1; }
-
-  # summary
+  # ---- 6) summary ----
   echo; ui_head "Summary"
   local k
   for k in $(printf '%s\n' "${!ST[@]}" | sort); do
-    [[ "$k" =~ (PASS|SECRET|KEY|PSK|TOKEN) ]] && { ui_kv "$k" "********"; continue; }
+    [[ "$k" =~ (PASS|SECRET|KEY|PSK|TOKEN|pass|secret|psk|token) ]] && { ui_kv "$k" "••••••••"; continue; }
     ui_kv "$k" "${ST[$k]}"
   done
   echo
-  ui_confirm "Apply this tunnel now?" y || { ui_warn "not applied"; return 1; }
+  ui_confirm "Apply and start this tunnel now?" y || { ui_warn "not applied"; ui_pause; return 1; }
 
   st_save
   require_root
@@ -3475,12 +3552,12 @@ mili_new_tunnel() {
   st_set state up; st_save
   ui_ok "tunnel '$name' created and started"
 
-  # pairing code for the other side
+  # ---- 7) pairing code (this side ALWAYS generates; peer only imports) ----
   if t_has "$type" pair_export; then
-    echo
-    if ui_confirm "Generate pairing code for the other server?" y; then
-      mili_export_code "$name"
-    fi
+    echo; mili_export_code "$name"
+    echo; ui_info "Next: on the OTHER server run mili → 'Import pairing code' and paste the code above."
+  else
+    ui_note "This tunnel type needs no pairing."
   fi
   ui_pause
 }
@@ -3526,49 +3603,54 @@ mili_import_code() {  # [code]
 # tunnel management screen
 # ============================================================================
 mili_manage() {
+  local sel=0
   while :; do
     ui_clear; ui_head "Tunnels"
     local names=(); mapfile -t names < <(st_list)
-    if [[ ${#names[@]} -eq 0 ]]; then ui_note "no tunnels yet"; ui_pause; return; fi
-    local i=1 n type st
+    if [[ ${#names[@]} -eq 0 ]]; then ui_note "no tunnels yet — create one from the main menu"; ui_pause; return; fi
+    printf '  %s↑/↓ select · Enter open · q back%s\n\n' "$C_GRY" "$C_RST"
+    local n type st labels=()
     for n in "${names[@]}"; do
       st_load "$n"; type="$(st_get type)"
-      if t_has "$type" health && t_call "$type" health "$n" >/dev/null 2>&1; then st="${C_GRN}up  ${C_RST}"; else st="${C_RED}down${C_RST}"; fi
-      printf '   %s%2s%s) %b %-12s %s%s%s\n' "$C_B$C_CYN" "$i" "$C_RST" "$st" "$n" "$C_GRY" "$type" "$C_RST"
-      ((i++))
+      if t_has "$type" health && t_call "$type" health "$n" >/dev/null 2>&1; then st="${C_GRN}● up${C_RST}"; else st="${C_RED}● down${C_RST}"; fi
+      labels+=("$(printf '%-12s %b' "$n" "$st")"$'\t'"$type · ${ST[role]:-}")
     done
-    ui_item 0 "Back"
-    local pick; pick="$(ui_ask 'Select tunnel' '')"
-    [[ "$pick" == 0 || -z "$pick" ]] && return
-    (( pick>=1 && pick<=${#names[@]} )) || continue
-    mili_tunnel_actions "${names[$((pick-1))]}"
+    labels+=("Back"$'\t')
+    ui_select "$sel" "${labels[@]}"
+    sel=$(( SEL>0 ? SEL-1 : sel ))
+    (( SEL==0 || SEL > ${#names[@]} )) && return
+    mili_tunnel_actions "${names[$((SEL-1))]}"
   done
 }
 
 mili_tunnel_actions() {  # <name>
-  local name="$1" type
+  local name="$1" type sel=0
   st_load "$name"; type="$(st_get type)"
   while :; do
-    ui_clear; ui_head "Tunnel: $name ($type)"
+    ui_clear; ui_head "Tunnel: $name  ($type)"
     t_has "$type" info && t_call "$type" info "$name"
     echo
-    ui_item 1 "Start";        ui_item 2 "Stop";       ui_item 3 "Restart"
-    ui_item 4 "Logs (follow)"; ui_item 5 "3x-ui JSON helper"
-    ui_item 6 "Test (socks/ping)"; ui_item 7 "Pairing code"
-    ui_item 8 "Edit / re-render"; ui_item 9 "Delete"
-    ui_item 0 "Back"
-    local a; a="$(ui_ask 'Action' '')"
-    case "$a" in
+    ui_select "$sel" \
+      $'Start' $'Stop' $'Restart' \
+      $'Logs (follow)' \
+      $'3x-ui JSON helper' \
+      $'Test (socks / ping)' \
+      $'Show pairing code' \
+      $'Edit / re-render' \
+      $'Delete' \
+      $'Back'
+    sel=$(( SEL>0 ? SEL-1 : sel ))
+    case "$SEL" in
       1) mili_up "$name"; ui_pause ;;
       2) mili_down "$name"; ui_pause ;;
       3) mili_restart "$name"; ui_pause ;;
-      4) local u; u="$(t_has "$type" unit && t_call "$type" unit "$name")"; [[ -n "$u" ]] && svc_logs_follow "$u" || ui_warn "no unit"; ;;
+      4) local u; u="$(t_has "$type" unit && t_call "$type" unit "$name")"; [[ -n "$u" ]] && svc_logs_follow "$u" || { ui_warn "no unit"; ui_pause; } ;;
       5) st_load "$name"; t_has "$type" xui && t_call "$type" xui "$name"; ui_pause ;;
       6) t_has "$type" test && t_call "$type" test "$name" || ui_warn "no test for $type"; ui_pause ;;
       7) mili_export_code "$name"; ui_pause ;;
       8) t_has "$type" wizard && { st_load "$name"; t_call "$type" wizard "$(st_get role)" advanced && st_save && mili_restart "$name"; }; ui_pause ;;
       9) mili_delete "$name" && return ;;
-      0|'') return ;;
+      10|0) return ;;
     esac
     st_load "$name"
   done
@@ -3577,23 +3659,26 @@ mili_tunnel_actions() {  # <name>
 # ============================================================================
 # dashboard header + main menu
 # ============================================================================
+# Fast header: counts come from the stored `state` field (no live probing, no
+# per-tunnel systemctl calls). Public IPv4 is cached after the first call.
 mili_header() {
   ui_clear
   ui_banner "unified anti-DPI tunnel manager  v$MILI_VERSION"
-  local up=0 down=0 n type
+  local total=0 up=0 n
   while read -r n; do
     [[ -z "$n" ]] && continue
-    st_load "$n"; type="$(st_get type)"
-    if t_has "$type" health && t_call "$type" health "$n" >/dev/null 2>&1; then ((up++)); else ((down++)); fi
+    ((total++))
+    grep -q '^state=up' "$MILI_TUNDIR/$n.conf" 2>/dev/null && ((up++))
   done < <(st_list)
   echo
   printf '  %s  %s  %s\n' "$(mili_edition_badge)" \
     "$(ui_badge "$(hostname -s 2>/dev/null || hostname)" "$C_BLU")" \
     "$(ui_badge "x-ui: $(xui_status_line)" "$C_MAG")"
   ui_kv "Public IPv4" "$(sys_public_ip4)"
-  local v6; v6=$(sys_public_ip6 2>/dev/null) && ui_kv "Public IPv6" "$v6"
-  ui_kv "Tunnels" "$(printf '%sup %s%s / %sdown %s%s  (total %s)' "$C_GRN" "$up" "$C_RST" "$C_RED" "$down" "$C_RST" "$((up+down))")"
-  if ! ports_audit >/dev/null 2>&1; then
+  [[ "${MILI_PUBIP6:-}" != "" && "${MILI_PUBIP6:-}" != none ]] && ui_kv "Public IPv6" "$MILI_PUBIP6"
+  ui_kv "Role default" "${MILI_DEFAULT_ROLE:-not set}"
+  ui_kv "Tunnels" "$(printf '%s%s up%s / %s%s stopped%s  (%s total)' "$C_GRN" "$up" "$C_RST" "$C_GRY" "$((total-up))" "$C_RST" "$total")"
+  if [[ -n "${MILI_PORT_ALERT:-}" ]]; then
     ui_err "PORT CONFLICT detected - open 'Ports & conflicts'"
   fi
   ui_hr 64
@@ -3602,24 +3687,32 @@ mili_header() {
 mili_menu() {
   require_root
   st_dir_init; ports_db_init
+  # one-shot public IP fetch so the first draw isn't blocked repeatedly
+  sys_public_ip4 >/dev/null 2>&1 &
+  local sel=0
   while :; do
+    # cheap port-conflict flag, refreshed once per full redraw
+    ports_audit >/dev/null 2>&1 && MILI_PORT_ALERT='' || MILI_PORT_ALERT=1
     mili_header
-    ui_item 1  "New tunnel" "" 1
-    ui_item 2  "Import pairing / patch code"
-    ui_item 3  "Manage tunnels"
-    ui_item 4  "3x-ui helper"
-    ui_item 5  "Ports & conflicts"
-    ui_item 6  "Cores (binaries)"
-    ui_item 7  "Network optimizer"
-    ui_item 8  "Diagnostics (doctor)"
-    ui_item 9  "Backup & restore"
-    ui_item 10 "Settings"
-    ui_item 11 "Edition / License"
-    ui_item 12 "Update mili"
-    ui_item 13 "Uninstall"
-    ui_item 0  "Exit"
-    local c; c="$(ui_ask 'Select' '')"
-    case "$c" in
+    printf '  %snavigate %s↑/↓%s   select %sEnter%s   quit %sq%s\n\n' \
+      "$C_GRY" "$C_CYN" "$C_GRY" "$C_CYN" "$C_GRY" "$C_CYN" "$C_RST"
+    ui_select "$sel" \
+      $'★ New tunnel\tcreate + get pairing code' \
+      $'Import pairing code\tpaste code from the other server' \
+      $'Manage tunnels\tstart · stop · logs · x-ui JSON · delete' \
+      $'3x-ui helper\tdetected panel / inbounds / recipes' \
+      $'Ports & conflicts\tregistry + live audit' \
+      $'Cores (binaries)\tinstall · update · rollback · offline' \
+      $'Network optimizer\tBBR · fq · MTU finder' \
+      $'Diagnostics\tdoctor · connectivity · bundle' \
+      $'Backup & restore' \
+      $'Settings' \
+      $'Edition / License' \
+      $'Update mili' \
+      $'Uninstall' \
+      $'Exit'
+    sel=$(( SEL>0 ? SEL-1 : sel ))
+    case "$SEL" in
       1) mili_new_tunnel ;;
       2) mili_import_code ;;
       3) mili_manage ;;
@@ -3633,7 +3726,8 @@ mili_menu() {
       11) mili_menu_edition ;;
       12) mili_update; ui_pause ;;
       13) mili_menu_uninstall ;;
-      0|'') ui_clear; exit 0 ;;
+      14) ui_clear; exit 0 ;;
+      0) ui_confirm "Quit mili?" y && { ui_clear; exit 0; } ;;
     esac
   done
 }
@@ -3663,37 +3757,38 @@ mili_menu_ports() {
 }
 
 mili_menu_cores() {
+  local cores=(frp backhaul paqet hedioum gost rathole hysteria singbox) sel=0
   while :; do
     ui_clear; ui_head "Cores (binaries)"
-    local cores=(frp backhaul paqet hedioum gost rathole hysteria singbox) c v inst
-    local i=1
+    ui_note "Enter on a core installs/updates it to the pinned version."
+    echo
+    local c v inst labels=()
     for c in "${cores[@]}"; do
       v="$(cores_version "$c")"; inst="$(cores_installed_version "$c" 2>/dev/null)"
-      if [[ -n "$inst" ]]; then printf '   %s%2s%s) %-10s %spinned %s%s  %sinstalled %s%s\n' "$C_B$C_CYN" "$i" "$C_RST" "$c" "$C_GRY" "$v" "$C_RST" "$C_GRN" "$inst" "$C_RST"
-      else printf '   %s%2s%s) %-10s %spinned %s  (not installed)%s\n' "$C_B$C_CYN" "$i" "$C_RST" "$c" "$C_GRY" "$v" "$C_RST"; fi
-      ((i++))
+      if [[ -n "$inst" ]]; then labels+=("$(printf '%-10s' "$c")"$'\t'"v$v · ${C_GRN}installed $inst${C_RST}")
+      else labels+=("$(printf '%-10s' "$c")"$'\t'"v$v · not installed"); fi
     done
-    ui_item 20 "Build offline bundle"; ui_item 21 "Import offline bundle"
-    ui_item 22 "Peer serve (foreign)"; ui_item 23 "Peer pull (iran)"
-    ui_item 0 "Back"
-    local a; a="$(ui_ask 'Install/update # or action' '')"
-    case "$a" in
-      0|'') return ;;
-      20) fetch_bundle; ui_pause ;;
-      21) local t; t="$(ui_ask 'Path to bundle tar.gz' '')"; fetch_bundle_import "$t"; ui_pause ;;
-      22) fetch_peer_serve; ui_pause ;;
-      23) local code; code="$(ui_ask 'Pull code' '')"; fetch_peer_pull "$code"; ui_pause ;;
-      *) (( a>=1 && a<=${#cores[@]} )) && { require_root; cores_install "${cores[$((a-1))]}"; ui_pause; } ;;
-    esac
+    labels+=("Build offline bundle"$'\t' "Import offline bundle"$'\t' \
+             "Peer serve (foreign)"$'\t' "Peer pull (iran)"$'\t' "Back"$'\t')
+    ui_select "$sel" "${labels[@]}"
+    sel=$(( SEL>0 ? SEL-1 : sel ))
+    local base=${#cores[@]}
+    if (( SEL>=1 && SEL<=base )); then require_root; cores_install "${cores[$((SEL-1))]}"; ui_pause
+    else case $(( SEL-base )) in
+      1) fetch_bundle; ui_pause ;;
+      2) local t; t="$(ui_ask 'Path to bundle tar.gz' '')"; fetch_bundle_import "$t"; ui_pause ;;
+      3) fetch_peer_serve; ui_pause ;;
+      4) local code; code="$(ui_ask 'Pull code' '')"; fetch_peer_pull "$code"; ui_pause ;;
+      *) return ;;
+    esac; fi
   done
 }
 
 mili_menu_optimize() {
   ui_clear; ui_head "Network optimizer"
   optimize_status; echo
-  ui_item 1 "Apply tuning (BBR + fq + buffers)"; ui_item 2 "Revert"; ui_item 3 "MTU finder"; ui_item 0 "Back"
-  local a; a="$(ui_ask 'Action' '')"
-  case "$a" in
+  ui_select 0 $'Apply tuning\tBBR + fq + buffers' $'Revert tuning' $'MTU finder' $'Back'
+  case "$SEL" in
     1) require_root; optimize_apply; ui_pause ;;
     2) require_root; optimize_revert; ui_pause ;;
     3) local h; h="$(ui_ask 'Target host/IP' '1.1.1.1')"; doctor_mtu "$h"; ui_pause ;;
@@ -3702,9 +3797,8 @@ mili_menu_optimize() {
 
 mili_menu_backup() {
   ui_clear; ui_head "Backup & restore"
-  ui_item 1 "Create backup"; ui_item 2 "List backups"; ui_item 3 "Restore"; ui_item 0 "Back"
-  local a; a="$(ui_ask 'Action' '')"
-  case "$a" in
+  ui_select 0 $'Create backup' $'List backups' $'Restore' $'Back'
+  case "$SEL" in
     1) require_root; backup_create >/dev/null; ui_pause ;;
     2) backup_list; ui_pause ;;
     3) local t; t="$(ui_ask 'Backup path' "$(backup_list 2>/dev/null | head -n1)")"; require_root; backup_restore "$t"; ui_pause ;;
@@ -3718,14 +3812,12 @@ mili_menu_settings() {
   ui_kv "Mirror"         "${MILI_MIRROR:-(none)}"
   ui_kv "Color mode"     "$MILI_COLORMODE"
   echo
-  ui_item 1 "Set default role"; ui_item 2 "Set GitHub proxy prefixes"; ui_item 3 "Set mirror base URL"; ui_item 0 "Back"
-  local a; a="$(ui_ask 'Action' '')"
-  case "$a" in
-    1) local r; r="$(ui_ask 'Default role (iran/foreign/server/client)' 'iran')"; mili_conf_set MILI_DEFAULT_ROLE "$r" ;;
-    2) local p; p="$(ui_ask 'Space-separated proxy prefixes' "$MILI_GH_PROXIES")"; mili_conf_set MILI_GH_PROXIES "$p" ;;
-    3) local m; m="$(ui_ask 'Mirror base URL' "$MILI_MIRROR")"; mili_conf_set MILI_MIRROR "$m" ;;
+  ui_select 0 $'Set default role\tiran / foreign' $'Set GitHub proxy prefixes' $'Set mirror base URL' $'Back'
+  case "$SEL" in
+    1) ui_select 0 $'iran' $'foreign'; [[ "$SEL" == 1 ]] && mili_conf_set MILI_DEFAULT_ROLE iran; [[ "$SEL" == 2 ]] && mili_conf_set MILI_DEFAULT_ROLE foreign; ui_pause ;;
+    2) local p; p="$(ui_ask 'Space-separated proxy prefixes' "$MILI_GH_PROXIES")"; mili_conf_set MILI_GH_PROXIES "$p"; ui_pause ;;
+    3) local m; m="$(ui_ask 'Mirror base URL' "$MILI_MIRROR")"; mili_conf_set MILI_MIRROR "$m"; ui_pause ;;
   esac
-  [[ "$a" =~ ^[123]$ ]] && ui_pause
 }
 
 mili_conf_set() {  # <KEY> <VALUE> : persist to mili.conf
@@ -3747,9 +3839,8 @@ mili_menu_edition() {
 
 mili_menu_uninstall() {
   ui_clear; ui_head "Uninstall"
-  ui_item 1 "Remove ONE tunnel"; ui_item 2 "Remove EVERYTHING (all tunnels + mili)"; ui_item 0 "Back"
-  local a; a="$(ui_ask 'Action' '')"
-  case "$a" in
+  ui_select 0 $'Remove ONE tunnel\topens Manage → Delete' $'Remove EVERYTHING\tall tunnels + mili (x-ui untouched)' $'Back'
+  case "$SEL" in
     1) mili_manage ;;
     2) mili_uninstall_all ;;
   esac

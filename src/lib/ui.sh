@@ -118,6 +118,71 @@ ui_item() {
   fi
 }
 
+# ============================================================================
+# arrow-key selector (live pointer, up/down + Enter). Returns 1-based index in
+# global SEL (0 = cancelled). Items may embed a hint as "label\thint".
+# Falls back to a numbered prompt when stdin/stdout is not a TTY or NO_COLOR.
+# ============================================================================
+declare -ga UISEL_ITEMS=()
+UISEL_SEL=0
+
+_ui_sel_row() {  # <index>
+  local i="$1" raw="${UISEL_ITEMS[$1]}" label hint
+  label="${raw%%$'\t'*}"; hint=''
+  [[ "$raw" == *$'\t'* ]] && hint="${raw#*$'\t'}"
+  if (( i == UISEL_SEL )); then
+    printf '\e[2K   %s%s %s%-30s%s%s%s%s\n' \
+      "$C_B$C_CYN" "▶" "$C_B$C_WHT" "$label" "$C_RST" \
+      "${hint:+  $C_CYN}" "$hint" "$C_RST"
+  else
+    printf '\e[2K     %s%-30s%s%s%s%s\n' \
+      "$C_WHT" "$label" "$C_RST" "${hint:+  $C_GRY}" "$hint" "$C_RST"
+  fi
+}
+
+_ui_sel_render() { local i; for i in "${!UISEL_ITEMS[@]}"; do _ui_sel_row "$i"; done; }
+
+# ui_select <preselect-index> <item> [item...]   -> sets SEL (1-based; 0=cancel)
+ui_select() {
+  local pre="${1:-0}"; shift
+  UISEL_ITEMS=("$@"); UISEL_SEL="$pre"
+  local n=${#UISEL_ITEMS[@]} key esc
+  (( n == 0 )) && { SEL=0; return; }
+  (( UISEL_SEL < 0 || UISEL_SEL >= n )) && UISEL_SEL=0
+
+  # fallback: no TTY / no color -> numbered prompt
+  if [[ ! -t 0 || ! -t 1 || "$MILI_COLORMODE" == none ]]; then
+    local i; for i in "${!UISEL_ITEMS[@]}"; do
+      printf '   %s%2d%s) %s\n' "$C_B$C_CYN" $((i+1)) "$C_RST" "${UISEL_ITEMS[$i]%%$'\t'*}"
+    done
+    local pick; read -r -p "$(printf '%s>%s ' "$C_CYN" "$C_RST")" pick || true
+    [[ "$pick" =~ ^[0-9]+$ ]] && SEL="$pick" || SEL=0
+    return
+  fi
+
+  tput civis 2>/dev/null || true
+  _ui_sel_render
+  while :; do
+    IFS= read -rsn1 key 2>/dev/null || { SEL=0; break; }
+    case "$key" in
+      $'\x1b') read -rsn2 -t 0.05 esc 2>/dev/null
+               case "$esc" in
+                 '[A'|'OA') (( UISEL_SEL = (UISEL_SEL - 1 + n) % n )) ;;
+                 '[B'|'OB') (( UISEL_SEL = (UISEL_SEL + 1) % n )) ;;
+                 '') SEL=0; break ;;   # bare ESC = cancel
+               esac ;;
+      ''|$'\n'|$'\r') SEL=$(( UISEL_SEL + 1 )); break ;;
+      k|K) (( UISEL_SEL = (UISEL_SEL - 1 + n) % n )) ;;
+      j|J) (( UISEL_SEL = (UISEL_SEL + 1) % n )) ;;
+      q|Q) SEL=0; break ;;
+      [1-9]) (( key >= 1 && key <= n )) && UISEL_SEL=$(( key - 1 )) ;;
+    esac
+    printf '\e[%dA' "$n"   # move back to top of list
+    _ui_sel_render
+  done
+  tput cnorm 2>/dev/null || true
+}
+
 # ---- prompts ---------------------------------------------------------------
 # ask <prompt> <default> -> echoes answer
 ui_ask() {

@@ -122,14 +122,23 @@ action runs `curl --socks5-hostname …` and shows the exit IP.
 
 ## Menu
 
+Full-screen, **arrow-key driven** (↑/↓ to move the pointer, **Enter** to select,
+**q** to go back/quit — digit keys jump too). The header is instant: tunnel
+counts come from stored state and the public IP is fetched once and cached.
+
 ```
-1  New tunnel            7  Network optimizer
-2  Import pairing code   8  Diagnostics (doctor)
-3  Manage tunnels        9  Backup & restore
-4  3x-ui helper          10 Settings
-5  Ports & conflicts     11 Edition / License
-6  Cores (binaries)      12 Update   13 Uninstall   0 Exit
+★ New tunnel           Network optimizer
+  Import pairing code   Diagnostics (doctor)
+  Manage tunnels        Backup & restore
+  3x-ui helper          Settings
+  Ports & conflicts     Edition / License
+  Cores (binaries)      Update · Uninstall · Exit
 ```
+
+**Pairing model:** you set up **one** server (Iran *or* Foreign) via *New
+tunnel* — it configures that side and prints **one** pairing code. On the other
+server you only run *Import pairing code* and paste it; it auto-configures the
+matching side. One code, one direction, no duplicate setup.
 
 CLI mirror:
 

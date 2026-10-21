@@ -86,26 +86,23 @@ sys_local_ip4() {
   ip -4 addr show dev "$ifc" 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}'
 }
 
-# public IP via several resolvers (no single point of failure); cached per run
+# public IP; cached for the whole run (first call ~1-2s max, rest instant).
+# Tries the fast local route hint first, then two quick HTTP resolvers.
 sys_public_ip4() {
   [[ -n "${MILI_PUBIP4:-}" ]] && { printf '%s' "$MILI_PUBIP4"; return 0; }
-  local urls=(https://api.ipify.org https://ifconfig.me/ip https://ipv4.icanhazip.com)
-  local u ip
+  local urls=(https://api.ipify.org https://ipv4.icanhazip.com) u ip
   for u in "${urls[@]}"; do
-    ip=$(curl -4 -fsS --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')
+    ip=$(curl -4 -fsS --connect-timeout 2 --max-time 3 "$u" 2>/dev/null | tr -d '[:space:]')
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { MILI_PUBIP4="$ip"; printf '%s' "$ip"; return 0; }
   done
-  ip="$(sys_local_ip4)"; MILI_PUBIP4="$ip"; printf '%s' "$ip"
+  ip="$(sys_local_ip4)"; MILI_PUBIP4="${ip:-unknown}"; printf '%s' "$MILI_PUBIP4"
 }
+# IPv6 is opt-in / lazy: single quick probe, cached. Empty if none.
 sys_public_ip6() {
-  [[ -n "${MILI_PUBIP6:-}" ]] && { printf '%s' "$MILI_PUBIP6"; return 0; }
-  local urls=(https://api6.ipify.org https://ipv6.icanhazip.com)
-  local u ip
-  for u in "${urls[@]}"; do
-    ip=$(curl -6 -fsS --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')
-    [[ "$ip" == *:* ]] && { MILI_PUBIP6="$ip"; printf '%s' "$ip"; return 0; }
-  done
-  return 1
+  [[ -n "${MILI_PUBIP6:-}" ]] && { printf '%s' "$MILI_PUBIP6"; [[ "$MILI_PUBIP6" == none ]] && return 1 || return 0; }
+  local ip; ip=$(curl -6 -fsS --connect-timeout 2 --max-time 3 https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]')
+  if [[ "$ip" == *:* ]]; then MILI_PUBIP6="$ip"; printf '%s' "$ip"; return 0; fi
+  MILI_PUBIP6=none; return 1
 }
 
 # validate an IPv4 literal
