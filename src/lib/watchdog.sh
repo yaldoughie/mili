@@ -32,7 +32,9 @@ watchdog_run() {
       _wd_log "health fail $name ($fails)"
       if (( fails >= 3 )); then
         _wd_log "restarting $name after $fails fails"
-        t_has "$type" up && t_call "$type" up "$name" >/dev/null 2>&1 || true
+        # restart the UNIT only (never re-run the wizard/setup path)
+        local u=''; t_has "$type" unit && u="$(t_call "$type" unit "$name" 2>/dev/null)"
+        [[ -n "$u" ]] && systemctl restart "$u" >/dev/null 2>&1 || true
         _wd_fails_set "$name" 0
       fi
     fi

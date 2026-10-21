@@ -71,13 +71,12 @@ mili_delete() {  # <name>
 # ============================================================================
 # new tunnel wizard (generic driver; per-type wizard fills ST)
 # ============================================================================
-# role descriptions per tunnel (what each side does)
+# short role descriptions (kept narrow so the selector never wraps)
 _role_hint() {  # <type> <role>
-  local role="$2"
   case "$2" in
-    iran)    printf 'Iran server — entry, sits next to 3x-ui (users connect here)' ;;
-    foreign) printf 'Foreign server — exit/egress abroad' ;;
-    *)       printf '%s' "$role" ;;
+    iran)    printf 'entry · next to 3x-ui' ;;
+    foreign) printf 'exit · egress abroad' ;;
+    *)       printf '%s' "$2" ;;
   esac
 }
 
@@ -118,6 +117,17 @@ mili_new_tunnel() {
   ui_select "$pre" "${rlabels[@]}"
   (( SEL==0 )) && return 0
   local role="${rarr[$((SEL-1))]}"
+
+  # ---- pairing direction: only the PRIMARY side generates the code ----
+  local primary; primary="$(t_meta_field "$type" primary)"; primary="${primary:-foreign}"
+  if [[ "$role" != "$primary" ]]; then
+    ui_clear; ui_head "New $(t_meta_field "$type" title) — $(printf '%s' "${role^}") side"
+    ui_info "This is the SECOND server. Set up the $primary server first;"
+    ui_info "it prints a pairing code. Paste that code here to finish this side."
+    echo
+    mili_import_code
+    return
+  fi
 
   # ---- 3) name ----
   local name
@@ -233,6 +243,15 @@ mili_tunnel_actions() {  # <name>
   st_load "$name"; type="$(st_get type)"
   while :; do
     ui_clear; ui_head "Tunnel: $name  ($type)"
+    # live connection status banner
+    local hstate hcolor hicon
+    if t_has "$type" health && t_call "$type" health "$name" >/dev/null 2>&1; then
+      hstate="CONNECTED"; hcolor="$C_GRN"; hicon="●"
+    else
+      hstate="NOT CONNECTED"; hcolor="$C_RED"; hicon="●"
+    fi
+    printf '  %s %s LINK: %s %s%s\n' "$hcolor" "$hicon" "$hstate" "$(grep -q '^state=up' "$MILI_TUNDIR/$name.conf" 2>/dev/null && printf '(started)' || printf '(stopped)')" "$C_RST"
+    ui_hr 64
     t_has "$type" info && t_call "$type" info "$name"
     echo
     ui_select "$sel" \
@@ -497,7 +516,6 @@ mili_svc_exec() {
   local engine="$1" name="$2"
   case "$engine" in
     socks)    socks_exec "$name" ;;
-    hedioum)  t_call hedioum svc_exec "$name" ;;
     frps|frpc)
       local _cfg="$MILI_ETC/engines/$engine/$name.toml" _bin
       _bin="$(cores_path "$engine")"

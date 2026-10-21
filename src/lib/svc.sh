@@ -24,10 +24,10 @@ svc_write_unit() {  # <unit-filename> <content>
 # script that mili renders into /etc/mili/engines. For engine daemons we point
 # at the installed core via /opt/mili/bin symlinks.
 svc_install_templates() {
+  # Restart*/limits live in [Service]; StartLimitIntervalSec belongs in [Unit].
   local common="Restart=always
 RestartSec=3
-LimitNOFILE=1048576
-StartLimitIntervalSec=0"
+LimitNOFILE=1048576"
 
   # generic engine template: mili-<engine>@<name>
   # launched via: mili _svc <engine> <name>  (reads config, execs core)
@@ -38,6 +38,7 @@ StartLimitIntervalSec=0"
 Description=mili $e tunnel instance %i
 After=network-online.target mili-fw.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -63,19 +64,8 @@ ExecStop=$MILI_BIN _l3 down %i
 [Install]
 WantedBy=multi-user.target"
 
-  # hedioum singleton
-  svc_write_unit "mili-hedioum.service" "[Unit]
-Description=mili Hedioum pool tunnel (singleton)
-After=network-online.target mili-fw.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$MILI_BIN _svc hedioum main
-$common
-
-[Install]
-WantedBy=multi-user.target"
+  # NOTE: Hedioum is NOT run by a mili unit. The hedioum-tunnel binary installs
+  # and manages its own `hedioum.service`; mili drives it via its CLI.
 
   # firewall restore at boot (rebuilds chains from state)
   svc_write_unit "mili-fw.service" "[Unit]

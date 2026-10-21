@@ -126,16 +126,21 @@ ui_item() {
 declare -ga UISEL_ITEMS=()
 UISEL_SEL=0
 
-_ui_sel_row() {  # <index>
-  local i="$1" raw="${UISEL_ITEMS[$1]}" label hint
+_ui_sel_row() {  # <index>  -- rows are truncated so they NEVER wrap (wrap would
+                 #             desync the relative cursor math and "repeat" rows)
+  local i="$1" raw="${UISEL_ITEMS[$1]}" label hint cols hmax
   label="${raw%%$'\t'*}"; hint=''
   [[ "$raw" == *$'\t'* ]] && hint="${raw#*$'\t'}"
+  cols="${COLUMNS:-0}"; (( cols < 1 )) && cols="$(tput cols 2>/dev/null || echo 80)"; (( cols < 40 )) && cols=40
+  # reserve: 5 (marker+indent) + 30 (label field) + 2 (gap) => hint budget
+  hmax=$(( cols - 40 )); (( hmax < 0 )) && hmax=0
+  [[ ${#label} -gt 32 ]] && label="${label:0:31}…"
+  [[ -n "$hint" && ${#hint} -gt $hmax ]] && hint="${hint:0:hmax}"
   if (( i == UISEL_SEL )); then
-    printf '\e[2K   %s%s %s%-30s%s%s%s%s\n' \
-      "$C_B$C_CYN" "▶" "$C_B$C_WHT" "$label" "$C_RST" \
-      "${hint:+  $C_CYN}" "$hint" "$C_RST"
+    printf '\e[2K   %s▶ %s%-32s%s%s%s%s\n' \
+      "$C_B$C_CYN" "$C_B$C_WHT" "$label" "$C_RST" "${hint:+  $C_CYN}" "$hint" "$C_RST"
   else
-    printf '\e[2K     %s%-30s%s%s%s%s\n' \
+    printf '\e[2K     %s%-32s%s%s%s%s\n' \
       "$C_WHT" "$label" "$C_RST" "${hint:+  $C_GRY}" "$hint" "$C_RST"
   fi
 }
@@ -160,6 +165,8 @@ ui_select() {
     return
   fi
 
+  # Each item is exactly one (truncated) physical line, so the list always
+  # occupies the bottom n lines; moving up n and reprinting is scroll-safe.
   tput civis 2>/dev/null || true
   _ui_sel_render
   while :; do
@@ -177,7 +184,7 @@ ui_select() {
       q|Q) SEL=0; break ;;
       [1-9]) (( key >= 1 && key <= n )) && UISEL_SEL=$(( key - 1 )) ;;
     esac
-    printf '\e[%dA' "$n"   # move back to top of list
+    printf '\e[%dA' "$n"   # back to top of the list (n single lines)
     _ui_sel_render
   done
   tput cnorm 2>/dev/null || true

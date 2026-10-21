@@ -8,7 +8,8 @@
 # install time by the multi-source fetcher; adjust here if upstream renames.
 
 MILI_OPT="/opt/mili"
-MILI_COREBIN="$MILI_OPT/bin"
+MILI_COREBIN="$MILI_OPT/bin"      # symlinks ONLY (one per binary)
+MILI_STORE="$MILI_OPT/store"      # versioned binaries: store/<core>/<ver>/<bin>
 
 # cores_manifest <core> -> prints: VER REPO ASSET ARCHMAP EXTRACT BINARIES
 # ASSET uses %V (version without v) and %A (mapped arch). BINARIES space list.
@@ -49,7 +50,13 @@ cores_url() {  # <core>
     backhaul) echo "https://github.com/Musixal/Backhaul/releases/download/v$v/backhaul_linux_${a}.tar.gz" ;;
     gost)     echo "https://github.com/go-gost/gost/releases/download/v$v/gost_${v}_linux_${a}.tar.gz" ;;
     paqet)    echo "https://github.com/hanselime/paqet/releases/download/v$v/paqet_linux_${a}.tar.gz" ;;
-    hedioum)  echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel_linux_${a}.tar.gz" ;;
+    hedioum)  # raw binaries (no archive): amd64='hedioum-tunnel', else suffixed
+              case "$MILI_ARCH" in
+                amd64) echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel" ;;
+                arm64) echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel-arm64" ;;
+                armv7) echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel-armv7" ;;
+                *) echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel" ;;
+              esac ;;
     rathole)  echo "https://github.com/rapiz1/rathole/releases/download/v$v/rathole-${a}-unknown-linux-musl.zip" ;;
     hysteria) echo "https://github.com/apernet/hysteria/releases/download/app/v$v/hysteria-linux-${a}" ;;
     singbox)  echo "https://github.com/SagerNet/sing-box/releases/download/v$v/sing-box-${v}-linux-${a}.tar.gz" ;;
@@ -73,12 +80,11 @@ cores_binaries() {  # <core>
 }
 
 cores_installed_version() {  # <core> -> prints installed ver or empty
-  local core="$1" link="$MILI_COREBIN/$core"
-  # first binary of the set acts as the probe
-  local first; first=$(cores_binaries "$core" | awk '{print $1}')
+  local core="$1" first link
+  first=$(cores_binaries "$core" | awk '{print $1}')
   link="$MILI_COREBIN/$first"
   [[ -L "$link" ]] || return 1
-  readlink "$link" 2>/dev/null | sed -E "s#.*/$core/([^/]+)/.*#\1#"
+  readlink "$link" 2>/dev/null | sed -E "s#.*/store/$core/([^/]+)/.*#\1#"
 }
 
 cores_is_installed() {  # <core>
@@ -86,33 +92,32 @@ cores_is_installed() {  # <core>
   [[ -x "$MILI_COREBIN/$first" ]]
 }
 
-# install (or reinstall) a core at its pinned version
+# install (or reinstall) a core at its pinned version.
+# Versioned binaries live in store/<core>/<ver>/; symlinks go in bin/ (never
+# collide, even when the binary name equals the core name, e.g. gost/backhaul).
 cores_install() {  # <core>
-  local core="$1" v url bins b arch dst tmp f
+  local core="$1" v url bins b dst tmp f found
   v=$(cores_version "$core") || { ui_err "unknown core: $core"; return 1; }
   url=$(cores_url "$core")   || { ui_err "no url for: $core"; return 1; }
   bins=$(cores_binaries "$core")
-  dst="$MILI_COREBIN/$core/$v"
-  run mkdir -p "$dst"
-  tmp="$(mktemp -d)"; f="$tmp/$(basename "$url")"
+  dst="$MILI_STORE/$core/$v"
+  mkdir -p "$dst" "$MILI_COREBIN"
+  tmp="$(mktemp -d)"; f="$tmp/dl_$(basename "$url")"
 
   fetch_url "$url" "$f" || { rm -rf "$tmp"; return 1; }
 
-  # extract by type
   case "$f" in
     *.tar.gz|*.tgz) tar -xzf "$f" -C "$tmp" 2>/dev/null || { ui_err "extract failed"; rm -rf "$tmp"; return 1; } ;;
     *.zip)          unzip -oq "$f" -d "$tmp" 2>/dev/null || { ui_err "unzip failed"; rm -rf "$tmp"; return 1; } ;;
-    *)              cp -f "$f" "$tmp/$(echo "$bins" | awk '{print $1}')" ;;  # raw binary (hysteria)
+    *)              cp -f "$f" "$tmp/$(echo "$bins" | awk '{print $1}')" ;;  # raw binary (hedioum/hysteria)
   esac
 
-  # locate each expected binary anywhere under tmp and place it
   for b in $bins; do
-    local found; found=$(find "$tmp" -type f -name "$b" 2>/dev/null | head -n1)
-    [[ -z "$found" ]] && found=$(find "$tmp" -type f -iname "$b*" 2>/dev/null | head -n1)
-    if [[ -z "$found" ]]; then ui_err "binary '$b' not found in $core archive"; rm -rf "$tmp"; return 1; fi
-    run cp -f "$found" "$dst/$b"
-    run chmod +x "$dst/$b"
-    run ln -sfn "$dst/$b" "$MILI_COREBIN/$b"
+    found=$(find "$tmp" -type f -name "$b" 2>/dev/null | head -n1)
+    [[ -z "$found" ]] && found=$(find "$tmp" -type f -iname "$b*" 2>/dev/null | grep -vi '\.txt$\|\.md$' | head -n1)
+    if [[ -z "$found" ]]; then ui_err "binary '$b' not found in $core download"; rm -rf "$tmp"; return 1; fi
+    install -m 0755 "$found" "$dst/$b"
+    ln -sfn "$dst/$b" "$MILI_COREBIN/$b"
   done
   rm -rf "$tmp"
   ui_ok "$core $v installed"
@@ -120,17 +125,18 @@ cores_install() {  # <core>
 
 cores_ensure() { cores_is_installed "$1" || cores_install "$1"; }
 
-# rollback: repoint symlinks to another installed version
 cores_versions_present() {  # <core>
-  ls -1 "$MILI_COREBIN/$1" 2>/dev/null | grep -vE '^[a-z-]+$' || true
+  ls -1 "$MILI_STORE/$1" 2>/dev/null || true
 }
 cores_rollback() {  # <core> <ver>
   local core="$1" ver="$2" b
-  [[ -d "$MILI_COREBIN/$core/$ver" ]] || { ui_err "version $ver not present"; return 1; }
+  [[ -d "$MILI_STORE/$core/$ver" ]] || { ui_err "version $ver not present"; return 1; }
   for b in $(cores_binaries "$core"); do
-    [[ -f "$MILI_COREBIN/$core/$ver/$b" ]] && run ln -sfn "$MILI_COREBIN/$core/$ver/$b" "$MILI_COREBIN/$b"
+    [[ -f "$MILI_STORE/$core/$ver/$b" ]] && ln -sfn "$MILI_STORE/$core/$ver/$b" "$MILI_COREBIN/$b"
   done
   ui_ok "$core rolled back to $ver"
 }
 
-cores_path() { printf '%s' "$MILI_COREBIN/$1"; }   # path to active binary symlink
+# path to a BINARY symlink (argument is a binary name, e.g. gost, frps, hedioum-tunnel)
+cores_path() { printf '%s' "$MILI_COREBIN/$1"; }
+cores_bin_ok() { [[ -x "$MILI_COREBIN/$1" && ! -d "$MILI_COREBIN/$1" ]]; }

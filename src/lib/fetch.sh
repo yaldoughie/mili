@@ -13,7 +13,8 @@ MILI_LOCAL_DIR="${MILI_LOCAL_DIR:-$MILI_ETC/offline}"
 
 _dl() {  # <url> <out> -> 0 on success
   local url="$1" out="$2"
-  curl -fL --connect-timeout 8 --max-time 300 --retry 2 -o "$out" "$url" 2>/dev/null
+  # short, bounded: a dead/404 source fails fast instead of hanging minutes
+  curl -fL --connect-timeout 8 --max-time 90 --retry 1 --retry-max-time 20 -o "$out" "$url" 2>/dev/null
 }
 
 # fetch_url <github-url> <out> : try chain until one works
@@ -61,7 +62,7 @@ verify_sha256() {
 fetch_bundle() {  # [out.tar.gz]
   local out="${1:-/root/mili-cores-$(date +%Y%m%d).tar.gz}"
   [[ -d /opt/mili/bin ]] || { ui_err "no cores installed"; return 1; }
-  run tar -czf "$out" -C /opt/mili bin && ui_ok "bundle -> $out"
+  run tar -czf "$out" -C /opt/mili bin store && ui_ok "bundle -> $out"
 }
 fetch_bundle_import() {  # <tar.gz>
   local tar="$1"
