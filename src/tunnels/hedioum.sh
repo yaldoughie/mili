@@ -18,6 +18,14 @@ _hed_bin() {
   return 1
 }
 
+# pull the pairing token out of setup-foreign output (several heuristics)
+_hed_extract_token() {
+  local out="$1" tok
+  tok="$(printf '%s' "$out" | grep -iE 'token|pair' | grep -oE '[A-Za-z0-9+/=_.:-]{16,}' | tail -n1)"
+  [[ -z "$tok" ]] && tok="$(printf '%s' "$out" | grep -oE '[A-Za-z0-9+/=_.:-]{24,}' | tail -n1)"
+  printf '%s' "$tok"
+}
+
 # ensure binary present + hedioum's own service installed, and reachable in PATH
 _hed_prepare() {
   cores_ensure hedioum || return 1
@@ -73,18 +81,29 @@ t_hedioum_up() {  # <name>
   local b; b="$(_hed_bin)"
 
   if [[ "${ST[role]}" == foreign ]]; then
-    local -a a=(setup-foreign --persona "${ST[persona]:-auto}")
-    [[ -n "${ST[domain]:-}" ]] && a+=(--domain "${ST[domain]}")
-    [[ -n "${ST[egress_mode]:-}" ]] && a+=(--egress "${ST[egress_mode]}")
-    [[ "${ST[move_ssh]:-no}" == yes ]] && a+=(--move-ssh)
-    [[ -n "${ST[mimics]:-}" ]] && a+=(--mimics "${ST[mimics]}")
-    ui_info "running: hedioum-tunnel ${a[*]}"
-    local out; out="$(run "$b" "${a[@]}" 2>&1)"; printf '%s\n' "$out" | sed 's/^/    /'
-    # extract the pairing token (longest token-like string in the output)
-    local tok; tok="$(printf '%s' "$out" | grep -oE '[A-Za-z0-9+/=_.:-]{40,}' | tail -n1)"
-    if [[ -n "$tok" ]]; then ST[token]="$tok"; ui_ok "captured pairing token"
-    else ui_warn "could not auto-detect the token above - copy it from the output for the Iran side"; fi
-    st_save
+    # already set up with a token and running? don't re-run (would rotate token)
+    if [[ -n "${ST[token]:-}" ]] && systemctl is-active --quiet hedioum.service 2>/dev/null; then
+      ui_ok "hedioum egress already configured (token stored)"
+    else
+      local -a a=(setup-foreign --persona "${ST[persona]:-auto}")
+      [[ -n "${ST[domain]:-}" ]] && a+=(--domain "${ST[domain]}")
+      [[ -n "${ST[egress_mode]:-}" ]] && a+=(--egress "${ST[egress_mode]}")
+      [[ "${ST[move_ssh]:-no}" == yes ]] && a+=(--move-ssh)
+      [[ -n "${ST[mimics]:-}" ]] && a+=(--mimics "${ST[mimics]}")
+      ui_info "running: hedioum-tunnel ${a[*]}"
+      local out; out="$(run "$b" "${a[@]}" 2>&1)"
+      printf '%s\n' "$out" | sed 's/^/    /'
+      printf '%s\n' "$out" >"$MILI_ETC/engines/hedioum-$name.out" 2>/dev/null || true
+      ST[token]="$(_hed_extract_token "$out")"
+      # fallback: ask the operator to paste it from the output above
+      if [[ -z "${ST[token]}" ]]; then
+        ui_warn "could not auto-detect the pairing token in the output above."
+        ui_note "copy the token string hedioum printed and paste it here."
+        ST[token]="$(ui_ask 'Hedioum pairing token' '')"
+      fi
+      if [[ -n "${ST[token]}" ]]; then ui_ok "pairing token stored"; else ui_err "no token — Iran side cannot pair until you provide it"; fi
+      st_save
+    fi
   else
     # iran hub (usually reached via import, but allow a manual re-apply)
     [[ -z "${ST[token]:-}" ]] && { ui_err "no token stored - import the foreign pairing code instead"; return 1; }

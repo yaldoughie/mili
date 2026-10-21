@@ -66,6 +66,12 @@ WantedBy=multi-user.target"
 
   # NOTE: Hedioum is NOT run by a mili unit. The hedioum-tunnel binary installs
   # and manages its own `hedioum.service`; mili drives it via its CLI.
+  # Clean up the deprecated singleton unit from older builds, if present.
+  if [[ -f "$MILI_UNITDIR/mili-hedioum.service" ]]; then
+    run systemctl disable --now mili-hedioum.service >/dev/null 2>&1 || true
+    run rm -f "$MILI_UNITDIR/mili-hedioum.service"
+    _svc_reload
+  fi
 
   # firewall restore at boot (rebuilds chains from state)
   svc_write_unit "mili-fw.service" "[Unit]

@@ -185,6 +185,14 @@ mili_export_code() {  # <name>
   st_load "$name" || { ui_err "unknown tunnel"; return 1; }
   type="$(st_get type)"
   t_has "$type" pair_export || { ui_warn "$type has no pairing"; return 1; }
+  # hedioum: a code without the token is useless — capture it now if missing
+  if [[ "$type" == hedioum && "$(st_get role)" == foreign && -z "$(st_get token)" ]]; then
+    ui_warn "no hedioum token stored yet for '$name'."
+    ui_note "paste the token hedioum printed during 'setup-foreign' (see Logs)."
+    local tk; tk="$(ui_ask 'Hedioum pairing token' '')"
+    [[ -z "$tk" ]] && { ui_err "token required to generate a pairing code"; return 1; }
+    st_set token "$tk"; st_save
+  fi
   payload="$(t_call "$type" pair_export "$name")"
   if ui_confirm "Encrypt the pairing code with a passphrase?" n; then
     pass="$(ui_ask_secret 'Passphrase')"
