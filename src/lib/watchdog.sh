@@ -22,6 +22,8 @@ watchdog_run() {
   while read -r name; do
     [[ -z "$name" ]] && continue
     st_load "$name" || continue
+    # only watch tunnels the operator started (never revive a stopped one)
+    [[ "$(st_get state)" == up ]] || continue
     type="$(st_get type)"
     t_has "$type" health || continue
     if t_call "$type" health "$name" >/dev/null 2>&1; then

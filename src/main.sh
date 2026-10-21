@@ -53,7 +53,20 @@ mili_down() {  # <name>
   ui_ok "tunnel '$name' stopped"
 }
 
-mili_restart() { mili_down "$1" >/dev/null 2>&1; mili_up "$1"; }
+mili_restart() {  # <name> : module 'restart' hook if present, else down+up
+  local name="$1" type
+  st_load "$name" || { ui_err "unknown tunnel: $name"; return 1; }
+  type="$(st_get type)"
+  if t_has "$type" restart; then
+    if t_call "$type" restart "$name"; then
+      st_load "$name"; st_set state up; st_save; ui_ok "tunnel '$name' restarted"
+    else
+      st_load "$name"; st_set state down; st_save; ui_warn "tunnel '$name' did not come back up"; return 1
+    fi
+    return 0
+  fi
+  mili_down "$name" >/dev/null 2>&1; mili_up "$name"
+}
 
 mili_delete() {  # <name>
   local name="$1" type
@@ -61,8 +74,12 @@ mili_delete() {  # <name>
   type="$(st_get type)"
   ui_warn "deleting tunnel '$name' (type $type) - removes its services, firewall rules and config"
   ui_confirm "really delete '$name'?" n || return 1
-  t_call "$type" down "$name" >/dev/null 2>&1 || true
-  t_has "$type" purge && t_call "$type" purge "$name" >/dev/null 2>&1 || true
+  if t_has "$type" remove; then
+    t_call "$type" remove "$name" || true       # module owns its full teardown
+  else
+    t_call "$type" down "$name" >/dev/null 2>&1 || true
+    t_has "$type" purge && t_call "$type" purge "$name" >/dev/null 2>&1 || true
+  fi
   fw_remove "$name"
   ports_release "$name"
   pool_meta_release "$name"
@@ -85,8 +102,7 @@ _role_hint() {  # <type> <role>
 
 mili_new_tunnel() {
   ui_clear; ui_head "New tunnel"
-  ui_note "You configure THIS server here. It produces ONE pairing code."
-  ui_note "On the OTHER server, run mili → 'Import pairing code' and paste it."
+  ui_note "You configure THIS server here, then carry ONE code/token to the other server."
   echo
 
   # ---- 1) tunnel type (arrow) ----
@@ -106,6 +122,7 @@ mili_new_tunnel() {
   (( SEL==0 || SEL > ${#types[@]} )) && return 0
   local type="${types[$((SEL-1))]}"
   feature_gate "tunnel.$type" || { ui_pause; return 1; }
+  local native=0; [[ "$(t_meta_field "$type" pairing)" == native ]] && native=1
 
   # ---- 2) which server is THIS one (arrow) ----
   local roles; roles="$(t_meta_field "$type" roles)"; roles="${roles:-iran foreign}"
@@ -116,21 +133,35 @@ mili_new_tunnel() {
     [[ "$r" == "${MILI_DEFAULT_ROLE:-}" ]] && pre=$idx
     ((idx++))
   done
-  echo; ui_info "Which server is this?"
+  echo
+  (( native )) && [[ -n "$(t_meta_field "$type" first_hint)" ]] && ui_note "$(t_meta_field "$type" first_hint)"
+  ui_info "Which server is this?"
   ui_select "$pre" "${rlabels[@]}"
   (( SEL==0 )) && return 0
   local role="${rarr[$((SEL-1))]}"
 
-  # ---- pairing direction: only the PRIMARY side generates the code ----
-  local primary; primary="$(t_meta_field "$type" primary)"; primary="${primary:-foreign}"
-  if [[ "$role" != "$primary" ]]; then
-    ui_clear; ui_head "New $(t_meta_field "$type" title) — $(printf '%s' "${role^}") side"
-    ui_info "This is the SECOND server. Set up the $primary server first;"
-    ui_info "it prints a pairing code. Paste that code here to finish this side."
-    echo
-    mili_import_code
-    return
+  # ---- mili-code tunnels: only the PRIMARY side generates the code ----
+  if (( !native )); then
+    local primary; primary="$(t_meta_field "$type" primary)"; primary="${primary:-foreign}"
+    if [[ "$role" != "$primary" ]]; then
+      ui_clear; ui_head "New $(t_meta_field "$type" title) — $(printf '%s' "${role^}") side"
+      ui_info "This is the SECOND server. Set up the $primary server first;"
+      ui_info "it prints a pairing code. Paste that code here to finish this side."
+      echo
+      mili_import_code
+      return
+    fi
   fi
+  mili_create "$type" "$role"
+}
+
+# mili_create <type> <role> : name -> wizard -> summary -> apply -> handoff
+# Native-pairing types (meta pairing=native) run their own wizard on BOTH sides
+# and hand over the core's own token instead of a mili pairing code.
+mili_create() {
+  local type="$1" role="$2" native=0
+  [[ "$(t_meta_field "$type" pairing)" == native ]] && native=1
+  ui_clear; ui_head "New $(t_meta_field "$type" title) — $(printf '%s' "${role^}") side"
 
   # ---- 3) name ----
   local name
@@ -141,10 +172,13 @@ mili_new_tunnel() {
     break
   done
 
-  # ---- 4) basic/advanced (arrow) ----
-  echo; ui_info "Option detail:"
-  ui_select 0 $'Basic\trecommended defaults, fewest questions' $'Advanced\texpose transport / tuning knobs'
-  local level=basic; [[ "$SEL" == 2 ]] && level=advanced
+  # ---- 4) basic/advanced (mili-code types only; native types ask their core's own list) ----
+  local level=full
+  if (( !native )); then
+    echo; ui_info "Option detail:"
+    ui_select 0 $'Basic\trecommended defaults, fewest questions' $'Advanced\texpose transport / tuning knobs'
+    level=basic; [[ "$SEL" == 2 ]] && level=advanced
+  fi
 
   # ---- 5) role-specific wizard ----
   ST=(); ST[name]="$name"; ST[type]="$type"; ST[role]="$role"; ST[created]="$(date -Iseconds 2>/dev/null || date)"
@@ -153,11 +187,7 @@ mili_new_tunnel() {
 
   # ---- 6) summary ----
   echo; ui_head "Summary"
-  local k
-  for k in $(printf '%s\n' "${!ST[@]}" | sort); do
-    [[ "$k" =~ (PASS|SECRET|KEY|PSK|TOKEN|pass|secret|psk|token) ]] && { ui_kv "$k" "••••••••"; continue; }
-    ui_kv "$k" "${ST[$k]}"
-  done
+  mili_summary "$type"
   echo
   ui_confirm "Apply and start this tunnel now?" y || { ui_warn "not applied"; ui_pause; return 1; }
 
@@ -165,16 +195,27 @@ mili_new_tunnel() {
   require_root
   fw_init
   svc_install_templates
-  t_has "$type" render && t_call "$type" render "$name"
-  if t_call "$type" up "$name"; then
+  local ok=0
+  if t_has "$type" provision; then
+    t_call "$type" provision "$name" && ok=1
+  else
+    t_has "$type" render && t_call "$type" render "$name"
+    t_call "$type" up "$name" && ok=1
+  fi
+  if (( ok )); then
     st_set state up; st_save; ui_ok "tunnel '$name' created and started"
   else
-    st_set state down; st_save; ui_warn "tunnel '$name' created but NOT started (fix the issue above, then Start it)"
+    st_set state down; st_save
+    ui_warn "tunnel '$name' saved but NOT running — fix the issue above, then Manage → $name → Edit."
+    ui_pause; return 1
   fi
 
-  # ---- 7) pairing code (generator side emits ONE code carrying its own IP) ----
-  if t_has "$type" pair_export; then
-    echo; mili_export_code "$name"
+  # ---- 7) hand over to the other server ----
+  echo
+  if (( native )) && t_has "$type" handoff; then
+    t_call "$type" handoff "$name"
+  elif t_has "$type" pair_export; then
+    mili_export_code "$name"
     local tw; tw="$(t_meta_field "$type" twoway)"
     echo
     if [[ "$tw" == yes ]]; then
@@ -191,6 +232,34 @@ mili_new_tunnel() {
   ui_pause
 }
 
+# summary of ST: module hook, else generic key list (secrets masked)
+mili_summary() {  # <type>
+  local type="$1" k
+  if t_has "$type" summary; then t_call "$type" summary; return; fi
+  for k in $(printf '%s\n' "${!ST[@]}" | sort); do
+    [[ "$k" =~ (PASS|SECRET|KEY|PSK|TOKEN|pass|secret|psk|token|auth) ]] && { ui_kv "$k" "••••••••"; continue; }
+    ui_kv "$k" "${ST[$k]}"
+  done
+}
+
+# Edit an existing native-pairing tunnel: same wizard (prefilled), then re-provision
+mili_native_edit() {  # <name>
+  local name="$1" type
+  st_load "$name" || return 1
+  type="$(st_get type)"
+  ui_clear; ui_head "Edit $(t_meta_field "$type" title) — '$name'"
+  t_call "$type" wizard "$(st_get role)" full || { ui_warn "edit aborted"; return 1; }
+  echo; ui_head "Summary"; mili_summary "$type"; echo
+  ui_confirm "Apply these changes now?" y || { ui_warn "not applied"; return 1; }
+  st_save; require_root; fw_init
+  if t_call "$type" provision "$name"; then
+    st_set state up; st_save; ui_ok "tunnel '$name' updated"
+    echo; t_has "$type" handoff && t_call "$type" handoff "$name"
+  else
+    st_set state down; st_save; ui_warn "tunnel '$name' NOT running after the edit (see above)"; return 1
+  fi
+}
+
 # ============================================================================
 # pairing
 # ============================================================================
@@ -198,15 +267,11 @@ mili_export_code() {  # <name>
   local name="$1" type payload pass=''
   st_load "$name" || { ui_err "unknown tunnel"; return 1; }
   type="$(st_get type)"
-  t_has "$type" pair_export || { ui_warn "$type has no pairing"; return 1; }
-  # hedioum: a code without the token is useless — capture it now if missing
-  if [[ "$type" == hedioum && "$(st_get role)" == foreign && -z "$(st_get token)" ]]; then
-    ui_warn "no hedioum token stored yet for '$name'."
-    ui_note "paste the token hedioum printed during 'setup-foreign' (see Logs)."
-    local tk; tk="$(ui_ask 'Hedioum pairing token' '')"
-    [[ -z "$tk" ]] && { ui_err "token required to generate a pairing code"; return 1; }
-    st_set token "$tk"; st_save
+  # native-pairing types hand over their core's own token, never a mili code
+  if [[ "$(t_meta_field "$type" pairing)" == native ]]; then
+    t_has "$type" handoff && t_call "$type" handoff "$name"; return
   fi
+  t_has "$type" pair_export || { ui_warn "$type has no pairing"; return 1; }
   payload="$(t_call "$type" pair_export "$name")"
   if ui_confirm "Encrypt the pairing code with a passphrase?" n; then
     pass="$(ui_ask_secret 'Passphrase')"
@@ -218,8 +283,24 @@ mili_export_code() {  # <name>
 mili_import_code() {  # [code]
   ui_head "Import pairing / reply code"
   local code="${1:-}" pass=''
-  [[ -z "$code" ]] && code="$(ui_ask 'Paste the code' '')"
+  [[ -z "$code" ]] && code="$(ui_ask 'Paste the code or token' '')"
+  code="$(printf '%s' "$code" | tr -d '[:space:]')"
   [[ -z "$code" ]] && return 1
+
+  # not a mili code? maybe a core's own token (native pairing, e.g. a Hedioum token)
+  if [[ "$code" != mili1:* && "$code" != mili1e:* ]]; then
+    local nt nrole
+    for nt in "${MILI_TYPES[@]}"; do
+      t_has "$nt" accepts_token || continue
+      nrole="$(t_call "$nt" accepts_token "$code")" || continue
+      ui_ok "recognized a $(t_meta_field "$nt" title) token -> setting up the ${nrole^} side"
+      MILI_PREFILL_TOKEN="$code"
+      mili_create "$nt" "$nrole"
+      MILI_PREFILL_TOKEN=''
+      return
+    done
+    ui_err "not a mili pairing code or a recognized tunnel token"; ui_pause; return 1
+  fi
   [[ "$code" == mili1e:* ]] && pass="$(ui_ask_secret 'Passphrase')"
   local payload; payload="$(pair_decode "$code" "$pass")" || { ui_pause; return 1; }
   local type name reply
@@ -294,6 +375,10 @@ mili_tunnel_actions() {  # <name>
     else
       hstate="NOT CONNECTED"; hcolor="$C_RED"; hicon="●"
     fi
+    local plabel='Show pairing code' native=0
+    if [[ "$(t_meta_field "$type" pairing)" == native ]]; then
+      native=1; plabel="$(t_meta_field "$type" handoff_label)"; plabel="${plabel:-Show pairing token}"
+    fi
     printf '  %s %s LINK: %s %s%s\n' "$hcolor" "$hicon" "$hstate" "$(grep -q '^state=up' "$MILI_TUNDIR/$name.conf" 2>/dev/null && printf '(started)' || printf '(stopped)')" "$C_RST"
     ui_hr 64
     t_has "$type" info && t_call "$type" info "$name"
@@ -303,7 +388,7 @@ mili_tunnel_actions() {  # <name>
       $'Logs (follow)' \
       $'3x-ui JSON helper' \
       $'Test (socks / ping)' \
-      $'Show pairing code' \
+      "$plabel" \
       $'Edit / re-render' \
       $'Delete' \
       $'Back'
@@ -316,7 +401,9 @@ mili_tunnel_actions() {  # <name>
       5) st_load "$name"; t_has "$type" xui && t_call "$type" xui "$name"; ui_pause ;;
       6) t_has "$type" test && t_call "$type" test "$name" || ui_warn "no test for $type"; ui_pause ;;
       7) mili_export_code "$name"; ui_pause ;;
-      8) t_has "$type" wizard && { st_load "$name"; t_call "$type" wizard "$(st_get role)" advanced && st_save && mili_restart "$name"; }; ui_pause ;;
+      8) if (( native )) && t_has "$type" provision; then mili_native_edit "$name"
+         elif t_has "$type" wizard; then st_load "$name"; t_call "$type" wizard "$(st_get role)" advanced && st_save && mili_restart "$name"; fi
+         ui_pause ;;
       9) mili_delete "$name" && return ;;
       10|0) return ;;
     esac

@@ -3,6 +3,8 @@
 install.sh  text eol=lf
 build.sh    text eol=lf
 *.bats      text eol=lf
+*.bash      text eol=lf
+tests/unit/fixtures/*.json text eol=lf
 dist/mili.sh text eol=lf
 # Default: normalize text, let git decide the rest
 *           text=auto

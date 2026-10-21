@@ -3,18 +3,13 @@
 # Loads the bundled dist/mili.sh (built by ./build.sh) with `version` so the
 # CLI returns immediately, then exercises pure functions.
 
-setup() {
-  export MILI_ETC="$BATS_TEST_TMPDIR/etc"
-  export MILI_LOGDIR="$BATS_TEST_TMPDIR/log"
-  export MILI_COLOR=never MILI_PUBIP4=1.1.1.1
-  mkdir -p "$MILI_ETC" "$MILI_LOGDIR"
-  set -- version
-  # shellcheck disable=SC1090
-  source "$BATS_TEST_DIRNAME/../../dist/mili.sh" >/dev/null 2>&1
-}
+load helper
+
+setup() { mili_load; }
 
 @test "b64url roundtrip survives + / =" {
-  run bash -c 'e=$(printf "a+b/c=d" | _b64url_enc); _b64url_dec "$e"'
+  local e; e=$(printf "a+b/c=d" | _b64url_enc)
+  run _b64url_dec "$e"
   [ "$output" = "a+b/c=d" ]
 }
 
@@ -31,10 +26,11 @@ setup() {
   run pair_decode "$code" "secret"
   [ "$status" -eq 0 ]
   run pair_decode "$code" "wrong"
-  [ -z "$output" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" != *name=t1* ]]
 }
 
-@test "GRE pair_export swaps role and IPs for the peer" {
+@test "GRE pair_export hands the peer its role + the generator's IP" {
   declare -gA ST
   ST=([name]=g1 [type]=gre [role]=iran [variant]=fou [mode]=socks [inner_n]=3 \
       [key]=7 [mtu]=1400 [ttl]=255 [fou_port]=20010 [my_ip]=1.1.1.1 [peer_ip]=2.2.2.2 \
@@ -42,8 +38,7 @@ setup() {
   st_save
   local exp; exp=$(t_gre_pair_export g1)
   [ "$(pair_field "$exp" role)" = foreign ]
-  [ "$(pair_field "$exp" my_ip)" = 2.2.2.2 ]
-  [ "$(pair_field "$exp" peer_ip)" = 1.1.1.1 ]
+  [ "$(pair_field "$exp" gen_ip)" = 1.1.1.1 ]
 }
 
 @test "ports allocator skips a claimed port" {

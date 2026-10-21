@@ -1,0 +1,54 @@
+{
+  "role": "foreign",
+  "foreign_listen_port": 22,
+  "auth_token": "aabbccddeeff00112233445566778899",
+  "egress_ip_mode": "ipv4",
+  "decoy_port": 2022,
+  "http_decoy_port": -1,
+  "domain": "vpn.example.com",
+  "decoy_style": "apache",
+  "persona": "cpanel",
+  "mimics": [
+    {
+      "type": "ssh",
+      "port": 22,
+      "decoy": "127.0.0.1:2022"
+    },
+    {
+      "type": "tls",
+      "port": 443
+    },
+    {
+      "type": "cpanel",
+      "port": 2083
+    },
+    {
+      "type": "whm",
+      "port": 2087
+    },
+    {
+      "type": "webmail",
+      "port": 2096
+    },
+    {
+      "type": "smtp",
+      "port": 587
+    },
+    {
+      "type": "mysql",
+      "port": 3306
+    },
+    {
+      "type": "smtps",
+      "port": 465
+    },
+    {
+      "type": "docker",
+      "port": 5000
+    },
+    {
+      "type": "imaps",
+      "port": 993
+    }
+  ]
+}

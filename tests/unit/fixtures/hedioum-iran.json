@@ -1,0 +1,49 @@
+{
+  "role": "iran",
+  "foreign_nodes": [
+    {
+      "alias": "hed1",
+      "target_ip": "",
+      "target_port": 0,
+      "local_socks_port": 10800,
+      "socks_bind": "127.0.0.1",
+      "endpoints": [
+        {
+          "target": "1.2.3.4:22",
+          "mimic": "ssh"
+        },
+        {
+          "target": "1.2.3.4:443",
+          "mimic": "tls",
+          "server_name": "vpn.example.com"
+        }
+      ],
+      "min_connections": 10,
+      "max_connections": 20,
+      "bandwidth_limit_mbps": 8,
+      "bandwidth_jitter_mbps": 2,
+      "auth_token": "aabbccddeeff00112233445566778899"
+    },
+    {
+      "alias": "DE-01",
+      "target_ip": "",
+      "target_port": 0,
+      "local_socks_port": 40001,
+      "socks_bind": "127.0.0.1",
+      "tun_enabled": true,
+      "tun_name": "hedioum0",
+      "tun_addr": "10.200.0.1/24",
+      "endpoints": [
+        {
+          "target": "5.6.7.8:22",
+          "mimic": "ssh"
+        }
+      ],
+      "min_connections": 10,
+      "max_connections": 20,
+      "bandwidth_limit_mbps": 8,
+      "bandwidth_jitter_mbps": 2,
+      "auth_token": "0189e772bfe63d815f026b8f76d292ea"
+    }
+  ]
+}

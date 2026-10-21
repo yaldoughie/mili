@@ -82,7 +82,7 @@ run `mili`. Core binaries move with `mili cores bundle` /
 | **FRP** | fatedier/frp reverse | Iran (public) | simple reverse tunnel over the open net |
 | **Backhaul** | tcp/mux/ws/wss/udp | Iran | high-throughput muxed reverse tunnel |
 | **paqet** | raw pcap packets + KCP | Foreign | aggressive anti-DPI, TCP-flag cycling |
-| **Hedioum** | mimic pool SOCKS (singleton) | Foreign egress | persona/mimic traffic shaping |
+| **Hedioum** | mimic pool SOCKS (native token) | Foreign egress | persona/mimic traffic shaping |
 
 All tunnels coexist. Any tunnel may layer over another's inner IP (that is how
 GRE+FRP works, and e.g. Backhaul-over-GRE). Hedioum and paqet don't layer (they
@@ -140,7 +140,17 @@ The side that **listens** generates the code and auto-embeds **its own public
 IP**; the other side pastes it and dials back automatically.
 
 - **Backhaul / FRP** → set up on **Iran** (it listens) → one code → paste on Foreign. Done.
-- **paqet / Hedioum** → set up on **Foreign** (it listens) → one code → paste on Iran. Done.
+- **paqet** → set up on **Foreign** (it listens) → one code → paste on Iran. Done.
+- **Hedioum** uses **its own pairing token**, not a mili code. mili asks the
+  same questions as hedioum's own wizard (Enter accepts every default):
+  **Foreign** → *New tunnel → Hedioum → Foreign* → mili runs
+  `hedioum-tunnel setup-foreign` and shows hedioum's token (+ QR).
+  **Iran** → *New tunnel → Hedioum → Iran* (or just paste the token into
+  *Import pairing code*) → mili runs `hedioum-tunnel add-node` with the tunnel
+  name as the node alias. Several foreign servers can share one Iran hub, and a
+  token from a plain hedioum install works too. Start/Stop/Delete on Iran only
+  touch that node; Delete on Foreign restores OpenSSH to its original port if
+  hedioum moved it.
 - **GRE / GRE+FRP** need *both* public IPs, so they use a two-step handshake:
   set up on **Iran** → code → paste on **Foreign** → Foreign prints a **reply
   code** → paste that back on Iran (*Import pairing code*). Link comes up. Still
