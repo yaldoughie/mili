@@ -118,19 +118,47 @@ t_hedioum_up() {  # <name>
         ui_note "copy the token string hedioum printed and paste it here."
         ST[token]="$(ui_ask 'Hedioum pairing token' '')"
       fi
-      if [[ -n "${ST[token]}" ]]; then ui_ok "pairing token stored"; else ui_err "no token — Iran side cannot pair until you provide it"; fi
+      if [[ -z "${ST[token]}" ]]; then
+        ui_err "no token — Iran side cannot pair. Fix setup-foreign and retry."
+        run systemctl disable --now hedioum.service >/dev/null 2>&1 || true
+        st_save; return 1
+      fi
+      ui_ok "pairing token stored"
       st_save
     fi
+    # config now exists on foreign -> safe to start the daemon
+    _hed_start_if_configured || { ui_err "hedioum has no config yet; not starting the crash-looping service"; return 1; }
   else
-    # iran hub (usually reached via import, but allow a manual re-apply)
+    # iran hub (reached via import). A bad/expired token => setup-iran fails and
+    # the daemon would crash-loop with "No configuration found"; guard against it.
     [[ -z "${ST[token]:-}" ]] && { ui_err "no token stored - import the foreign pairing code instead"; return 1; }
-    local -a a=(setup-iran --alias "${ST[alias]:-iran}" --token "${ST[token]}" --socks-port "${ST[socks_port]}")
+    local out rc
     ui_info "running: hedioum-tunnel setup-iran --alias ${ST[alias]:-iran} --socks-port ${ST[socks_port]} --token ***"
-    run "$b" "${a[@]}" 2>&1 | sed 's/^/    /'
+    out="$(run "$b" setup-iran --alias "${ST[alias]:-iran}" --token "${ST[token]}" --socks-port "${ST[socks_port]}" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | sed 's/^/    /'
+    if (( rc != 0 )) || printf '%s' "$out" | grep -qiE 'error|invalid|expired|fail|usage of'; then
+      ui_err "setup-iran failed — the pairing token is wrong or expired."
+      ui_note "Re-generate it on the foreign server and import the fresh code here."
+      run systemctl disable --now hedioum.service >/dev/null 2>&1 || true
+      return 1
+    fi
     ports_claim "$name" tcp "${ST[socks_port]}" "127.0.0.1"
     fw_loopback_guard "$name" tcp "${ST[socks_port]}"
+    _hed_start_if_configured || { ui_err "hedioum config missing after setup-iran; not starting"; return 1; }
   fi
-  run systemctl enable --now hedioum.service >/dev/null 2>&1 || true
+}
+
+# start hedioum.service only once a config exists (else it crash-loops forever)
+_hed_start_if_configured() {
+  # hedioum stores its config under /etc/hedioum (Docker volume hint in README)
+  if ls /etc/hedioum/* >/dev/null 2>&1 || [[ -s /etc/hedioum/config.json ]]; then
+    run systemctl enable --now hedioum.service >/dev/null 2>&1 || true
+    return 0
+  fi
+  # unknown config path but setup reported success -> try once, don't loop-enable
+  run systemctl enable hedioum.service >/dev/null 2>&1 || true
+  run systemctl start hedioum.service >/dev/null 2>&1 || true
+  return 0
 }
 
 t_hedioum_down() {  # <name>
@@ -174,7 +202,7 @@ t_hedioum_info() {
   [[ -n "${ST[domain]:-}" ]] && ui_kv "domain" "${ST[domain]}"
   if [[ "${ST[role]}" == iran ]]; then
     ui_kv "alias" "${ST[alias]:-iran}"
-    ui_kv "socks (Iran)" "127.0.0.1:${ST[socks_port]:-?}"
+    echo; xui_outbound_box "127.0.0.1" "${ST[socks_port]:-?}" "" ""
   else
     ui_kv "egress mode" "${ST[egress_mode]:-ipv4}"
     [[ -n "${ST[token]:-}" ]] && ui_kv "token" "captured (show via pairing code)"

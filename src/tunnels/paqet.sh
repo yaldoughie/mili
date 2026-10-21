@@ -162,7 +162,7 @@ t_paqet_info() {
     ui_kv "listen" "0.0.0.0:${ST[listen_port]} (raw)"
   else
     ui_kv "dials" "${ST[foreign_ip]}:${ST[listen_port]}"
-    ui_kv "socks (Iran)" "127.0.0.1:${ST[socks_port]}"
+    echo; xui_outbound_box "127.0.0.1" "${ST[socks_port]}" "" ""
   fi
 }
 

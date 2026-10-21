@@ -1501,6 +1501,17 @@ xui_status_line() {
   printf '%s (panel:%s)' "$st" "${p:-?}"
 }
 
+# compact, copyable "what to put in the x-ui outbound" box (shown in info)
+xui_outbound_box() {  # <addr> <port> [user] [pass]
+  ui_hr 64
+  printf '  %s▶ SET THIS IN 3x-ui OUTBOUND%s  (or use the "3x-ui JSON helper" action)\n' "$C_B$C_GRN" "$C_RST"
+  ui_kv "protocol" "socks  (SOCKS5)"
+  ui_kv "address"  "$1"
+  ui_kv "port"     "$2"
+  if [[ -n "${3:-}" ]]; then ui_kv "username" "$3"; ui_kv "password" "$4"; else ui_kv "auth" "none (no user/pass)"; fi
+  ui_hr 64
+}
+
 # produce a SOCKS outbound JSON block for a tunnel's local SOCKS endpoint
 xui_socks_json() {  # <tag> <addr> <port> <user> <pass>
   local tag="$1" addr="$2" port="$3" user="$4" pass="$5"
@@ -2000,7 +2011,7 @@ t_backhaul_info() {
   ui_kv "transport" "${ST[transport]}"
   if [[ "${ST[role]}" == iran ]]; then
     ui_kv "listen" "0.0.0.0:${ST[tunnel_port]}"
-    [[ "${ST[mode]}" == socks ]] && ui_kv "socks (Iran)" "127.0.0.1:${ST[iran_socks]} (user ${ST[socks_user]})"
+    [[ "${ST[mode]}" == socks ]] && { echo; xui_outbound_box "127.0.0.1" "${ST[iran_socks]}" "${ST[socks_user]}" "${ST[socks_pass]}"; }
     [[ "${ST[mode]}" == forward ]] && ui_kv "ports" "${ST[fwd]}"
   else
     ui_kv "dials" "${ST[iran_ip]}:${ST[tunnel_port]}"
@@ -2270,7 +2281,7 @@ t_frp_info() {
   ui_kv "transport" "${ST[transport]} tls=${ST[tls]}"
   if [[ "${ST[role]}" == iran ]]; then
     ui_kv "frps bind" "0.0.0.0:${ST[bind_port]}"
-    [[ "${ST[mode]}" == socks ]] && ui_kv "socks (Iran)" "127.0.0.1:${ST[remote_port]} (user ${ST[socks_user]})"
+    [[ "${ST[mode]}" == socks ]] && { echo; xui_outbound_box "127.0.0.1" "${ST[remote_port]}" "${ST[socks_user]}" "${ST[socks_pass]}"; }
     [[ "${ST[mode]}" == forward ]] && ui_kv "forward" "${ST[fwd]}"
   else
     ui_kv "dials" "${ST[iran_ip]}:${ST[bind_port]}"
@@ -2560,9 +2571,12 @@ t_gre_info() {  # <name>
   ui_kv "mtu/ttl" "${ST[mtu]}/${ST[ttl]}"
   [[ "${ST[variant]}" == fou ]] && ui_kv "fou udp" "${ST[fou_port]}"
   case "${ST[mode]}" in
-    socks)   ui_kv "socks" "${ST[inner_local]}:${ST[socks_port]} (user ${ST[socks_user]})" ;;
+    socks)
+      # the SOCKS server runs on the FOREIGN inner IP; Iran reaches it over the tunnel
+      local saddr; [[ "${ST[role]}" == iran ]] && saddr="${ST[inner_peer]}" || saddr="${ST[inner_local]}"
+      echo; xui_outbound_box "$saddr" "${ST[socks_port]}" "${ST[socks_user]}" "${ST[socks_pass]}" ;;
     forward) ui_kv "forward" "${ST[fwd]}" ;;
-    l3)      ui_kv "exit" "via foreign MASQUERADE" ;;
+    l3)      ui_kv "exit" "via foreign MASQUERADE (freedom outbound, sendThrough ${ST[inner_local]})" ;;
   esac
 }
 
@@ -2913,7 +2927,7 @@ t_grefrp_info() {
   ui_kv "inner" "${ST[inner_local]} <-> ${ST[inner_peer]}"
   ui_kv "frp" "inner :${ST[bind_port]} transport=${ST[transport]} tls=${ST[tls]}"
   [[ "${ST[variant]}" == fou ]] && ui_kv "fou udp" "${ST[fou_port]} (only public port)"
-  [[ "${ST[role]}" == iran && "${ST[mode]}" == socks ]] && ui_kv "socks (Iran)" "127.0.0.1:${ST[remote_port]}"
+  [[ "${ST[role]}" == iran && "${ST[mode]}" == socks ]] && { echo; xui_outbound_box "127.0.0.1" "${ST[remote_port]}" "${ST[socks_user]}" "${ST[socks_pass]}"; }
   [[ "${ST[mode]}" == forward ]] && ui_kv "forward" "${ST[fwd]}"
 }
 
@@ -3123,19 +3137,47 @@ t_hedioum_up() {  # <name>
         ui_note "copy the token string hedioum printed and paste it here."
         ST[token]="$(ui_ask 'Hedioum pairing token' '')"
       fi
-      if [[ -n "${ST[token]}" ]]; then ui_ok "pairing token stored"; else ui_err "no token — Iran side cannot pair until you provide it"; fi
+      if [[ -z "${ST[token]}" ]]; then
+        ui_err "no token — Iran side cannot pair. Fix setup-foreign and retry."
+        run systemctl disable --now hedioum.service >/dev/null 2>&1 || true
+        st_save; return 1
+      fi
+      ui_ok "pairing token stored"
       st_save
     fi
+    # config now exists on foreign -> safe to start the daemon
+    _hed_start_if_configured || { ui_err "hedioum has no config yet; not starting the crash-looping service"; return 1; }
   else
-    # iran hub (usually reached via import, but allow a manual re-apply)
+    # iran hub (reached via import). A bad/expired token => setup-iran fails and
+    # the daemon would crash-loop with "No configuration found"; guard against it.
     [[ -z "${ST[token]:-}" ]] && { ui_err "no token stored - import the foreign pairing code instead"; return 1; }
-    local -a a=(setup-iran --alias "${ST[alias]:-iran}" --token "${ST[token]}" --socks-port "${ST[socks_port]}")
+    local out rc
     ui_info "running: hedioum-tunnel setup-iran --alias ${ST[alias]:-iran} --socks-port ${ST[socks_port]} --token ***"
-    run "$b" "${a[@]}" 2>&1 | sed 's/^/    /'
+    out="$(run "$b" setup-iran --alias "${ST[alias]:-iran}" --token "${ST[token]}" --socks-port "${ST[socks_port]}" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | sed 's/^/    /'
+    if (( rc != 0 )) || printf '%s' "$out" | grep -qiE 'error|invalid|expired|fail|usage of'; then
+      ui_err "setup-iran failed — the pairing token is wrong or expired."
+      ui_note "Re-generate it on the foreign server and import the fresh code here."
+      run systemctl disable --now hedioum.service >/dev/null 2>&1 || true
+      return 1
+    fi
     ports_claim "$name" tcp "${ST[socks_port]}" "127.0.0.1"
     fw_loopback_guard "$name" tcp "${ST[socks_port]}"
+    _hed_start_if_configured || { ui_err "hedioum config missing after setup-iran; not starting"; return 1; }
   fi
-  run systemctl enable --now hedioum.service >/dev/null 2>&1 || true
+}
+
+# start hedioum.service only once a config exists (else it crash-loops forever)
+_hed_start_if_configured() {
+  # hedioum stores its config under /etc/hedioum (Docker volume hint in README)
+  if ls /etc/hedioum/* >/dev/null 2>&1 || [[ -s /etc/hedioum/config.json ]]; then
+    run systemctl enable --now hedioum.service >/dev/null 2>&1 || true
+    return 0
+  fi
+  # unknown config path but setup reported success -> try once, don't loop-enable
+  run systemctl enable hedioum.service >/dev/null 2>&1 || true
+  run systemctl start hedioum.service >/dev/null 2>&1 || true
+  return 0
 }
 
 t_hedioum_down() {  # <name>
@@ -3179,7 +3221,7 @@ t_hedioum_info() {
   [[ -n "${ST[domain]:-}" ]] && ui_kv "domain" "${ST[domain]}"
   if [[ "${ST[role]}" == iran ]]; then
     ui_kv "alias" "${ST[alias]:-iran}"
-    ui_kv "socks (Iran)" "127.0.0.1:${ST[socks_port]:-?}"
+    echo; xui_outbound_box "127.0.0.1" "${ST[socks_port]:-?}" "" ""
   else
     ui_kv "egress mode" "${ST[egress_mode]:-ipv4}"
     [[ -n "${ST[token]:-}" ]] && ui_kv "token" "captured (show via pairing code)"
@@ -3400,7 +3442,7 @@ t_paqet_info() {
     ui_kv "listen" "0.0.0.0:${ST[listen_port]} (raw)"
   else
     ui_kv "dials" "${ST[foreign_ip]}:${ST[listen_port]}"
-    ui_kv "socks (Iran)" "127.0.0.1:${ST[socks_port]}"
+    echo; xui_outbound_box "127.0.0.1" "${ST[socks_port]}" "" ""
   fi
 }
 

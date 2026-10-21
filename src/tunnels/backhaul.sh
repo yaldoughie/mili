@@ -208,7 +208,7 @@ t_backhaul_info() {
   ui_kv "transport" "${ST[transport]}"
   if [[ "${ST[role]}" == iran ]]; then
     ui_kv "listen" "0.0.0.0:${ST[tunnel_port]}"
-    [[ "${ST[mode]}" == socks ]] && ui_kv "socks (Iran)" "127.0.0.1:${ST[iran_socks]} (user ${ST[socks_user]})"
+    [[ "${ST[mode]}" == socks ]] && { echo; xui_outbound_box "127.0.0.1" "${ST[iran_socks]}" "${ST[socks_user]}" "${ST[socks_pass]}"; }
     [[ "${ST[mode]}" == forward ]] && ui_kv "ports" "${ST[fwd]}"
   else
     ui_kv "dials" "${ST[iran_ip]}:${ST[tunnel_port]}"

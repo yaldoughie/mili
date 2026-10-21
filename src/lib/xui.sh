@@ -27,6 +27,17 @@ xui_status_line() {
   printf '%s (panel:%s)' "$st" "${p:-?}"
 }
 
+# compact, copyable "what to put in the x-ui outbound" box (shown in info)
+xui_outbound_box() {  # <addr> <port> [user] [pass]
+  ui_hr 64
+  printf '  %s▶ SET THIS IN 3x-ui OUTBOUND%s  (or use the "3x-ui JSON helper" action)\n' "$C_B$C_GRN" "$C_RST"
+  ui_kv "protocol" "socks  (SOCKS5)"
+  ui_kv "address"  "$1"
+  ui_kv "port"     "$2"
+  if [[ -n "${3:-}" ]]; then ui_kv "username" "$3"; ui_kv "password" "$4"; else ui_kv "auth" "none (no user/pass)"; fi
+  ui_hr 64
+}
+
 # produce a SOCKS outbound JSON block for a tunnel's local SOCKS endpoint
 xui_socks_json() {  # <tag> <addr> <port> <user> <pass>
   local tag="$1" addr="$2" port="$3" user="$4" pass="$5"

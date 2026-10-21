@@ -201,7 +201,7 @@ t_frp_info() {
   ui_kv "transport" "${ST[transport]} tls=${ST[tls]}"
   if [[ "${ST[role]}" == iran ]]; then
     ui_kv "frps bind" "0.0.0.0:${ST[bind_port]}"
-    [[ "${ST[mode]}" == socks ]] && ui_kv "socks (Iran)" "127.0.0.1:${ST[remote_port]} (user ${ST[socks_user]})"
+    [[ "${ST[mode]}" == socks ]] && { echo; xui_outbound_box "127.0.0.1" "${ST[remote_port]}" "${ST[socks_user]}" "${ST[socks_pass]}"; }
     [[ "${ST[mode]}" == forward ]] && ui_kv "forward" "${ST[fwd]}"
   else
     ui_kv "dials" "${ST[iran_ip]}:${ST[bind_port]}"

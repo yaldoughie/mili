@@ -245,7 +245,7 @@ t_grefrp_info() {
   ui_kv "inner" "${ST[inner_local]} <-> ${ST[inner_peer]}"
   ui_kv "frp" "inner :${ST[bind_port]} transport=${ST[transport]} tls=${ST[tls]}"
   [[ "${ST[variant]}" == fou ]] && ui_kv "fou udp" "${ST[fou_port]} (only public port)"
-  [[ "${ST[role]}" == iran && "${ST[mode]}" == socks ]] && ui_kv "socks (Iran)" "127.0.0.1:${ST[remote_port]}"
+  [[ "${ST[role]}" == iran && "${ST[mode]}" == socks ]] && { echo; xui_outbound_box "127.0.0.1" "${ST[remote_port]}" "${ST[socks_user]}" "${ST[socks_pass]}"; }
   [[ "${ST[mode]}" == forward ]] && ui_kv "forward" "${ST[fwd]}"
 }
 

@@ -218,9 +218,12 @@ t_gre_info() {  # <name>
   ui_kv "mtu/ttl" "${ST[mtu]}/${ST[ttl]}"
   [[ "${ST[variant]}" == fou ]] && ui_kv "fou udp" "${ST[fou_port]}"
   case "${ST[mode]}" in
-    socks)   ui_kv "socks" "${ST[inner_local]}:${ST[socks_port]} (user ${ST[socks_user]})" ;;
+    socks)
+      # the SOCKS server runs on the FOREIGN inner IP; Iran reaches it over the tunnel
+      local saddr; [[ "${ST[role]}" == iran ]] && saddr="${ST[inner_peer]}" || saddr="${ST[inner_local]}"
+      echo; xui_outbound_box "$saddr" "${ST[socks_port]}" "${ST[socks_user]}" "${ST[socks_pass]}" ;;
     forward) ui_kv "forward" "${ST[fwd]}" ;;
-    l3)      ui_kv "exit" "via foreign MASQUERADE" ;;
+    l3)      ui_kv "exit" "via foreign MASQUERADE (freedom outbound, sendThrough ${ST[inner_local]})" ;;
   esac
 }
 
