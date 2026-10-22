@@ -165,6 +165,29 @@ side that **listens** first; it shows exactly what to use on the other server.
   code** → paste that back on Iran (*Import pairing code*). Link comes up. Still
   zero manual IP entry — each side auto-detects its own address.
 
+### ECH (Encrypted Client Hello)
+
+Some networks now drop TLS ClientHellos that carry the ECH extension, which
+shows up as **TLS handshake timeouts**. mili itself never turns ECH on. Which
+tunnels send it:
+
+| Tunnel | Iran → foreign TLS | ECH extension |
+|---|---|---|
+| Hedioum: every mimic **except `ssh`** (tls, https-alt, cpanel, whm, webmail, directadmin, docker, grafana, prometheus, smtps, imaps, smtp, imap, postgres, mysql) | uTLS Chrome ClientHello, built into the hedioum binary | **yes** (GREASE ECH, no hedioum flag to turn it off) |
+| Hedioum `ssh` mimic | no TLS | no |
+| Backhaul wss / wssmux | Go standard `crypto/tls` | no |
+| FRP / GRE+FRP with TLS | Go standard `crypto/tls` | no |
+| Backhaul tcp/tcpmux/ws/udp, paqet, GRE | no TLS | no |
+
+**ECH-free mode (Hedioum, Iran side):** the Iran wizard asks *All mimics* or
+*ECH-free*. ECH-free dials only the foreign's SSH mimic (no TLS, no ECH),
+using hedioum's own `add-node --target-ip … --mimics ssh --ssh-port …`.
+To switch an existing node: *Manage → node → Edit* and pick *ECH-free* (pick
+*All mimics* to go back; the foreign server is unchanged either way). This only
+works when the foreign's persona includes the SSH mimic, which every built-in
+persona does. *Test* prints a hint when TLS mimics fail in the handshake while
+SSH still works.
+
 CLI mirror:
 
 ```

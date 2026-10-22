@@ -162,3 +162,83 @@ TOKF=eyJ2IjoyLCJpcCI6IjkuOS45LjkiLCJhdXRoIjoiYWFiYmNjZGRlZWZmMDAxMTIyMzM0NDU1NjY
 @test "hedioum is a native-pairing tunnel" {
   [ "$(t_meta_field hedioum pairing)" = native ]
 }
+
+# ---- ECH-free mode (SSH mimic only) ----------------------------------------
+_iran_st() {  # <token> <eps> [noech]
+  ST=([name]=de1 [role]=iran [token]="$1" [eps]="$2" [exit_ip]=95.179.148.154
+      [persona]=cpanel [socks_port]=10801 [min]=10 [max]=20 [bw]=8 [jitter]=2 [noech]="${3:-no}")
+}
+
+@test "eps port lookup: hit and miss" {
+  [ "$(_hed_eps_port 'cpanel:2083 mysql:3306 ssh:2200 tls:443' ssh)" = 2200 ]
+  [ "$(_hed_eps_port 'cpanel:2083 mysql:3306 ssh:2200 tls:443' tls)" = 443 ]
+  refute _hed_eps_port 'tls:443 https-alt:8443' ssh
+  refute _hed_eps_port '' ssh
+}
+
+@test "add-node args, normal mode: full v2 token, no endpoint override" {
+  _iran_st "$TOK1" 'cpanel:2083 mysql:3306 ssh:2200 tls:443' no
+  _hed_add_args
+  local s=" ${HED_ADD_ARGS[*]} "
+  [[ "$s" == *" add-node --alias de1 --token $TOK1 --socks-port 10801 "* ]]
+  [[ "$s" != *" --mimics "* ]]
+  [[ "$s" != *" --target-ip "* ]]
+}
+
+@test "add-node args, ECH-free: auth key + SSH mimic only" {
+  _iran_st "$TOK1" 'cpanel:2083 mysql:3306 ssh:2200 tls:443' yes
+  _hed_add_args
+  local s=" ${HED_ADD_ARGS[*]} "
+  [[ "$s" == *" --token aabbccddeeff00112233445566778899 --target-ip 95.179.148.154 --mimics ssh --ssh-port 2200 "* ]]
+  [[ "$s" != *" $TOK1 "* ]]
+  [[ "$s" != *" --persona "* ]]
+  [[ "$s" == *" --socks-port 10801 "* ]]
+}
+
+@test "add-node args, ECH-free with a legacy hex token" {
+  _iran_st 0189e772bfe63d815f026b8f76d292ea 'ssh:22 tls:443 cpanel:2083' yes
+  ST[legacy]=yes
+  _hed_add_args
+  local s=" ${HED_ADD_ARGS[*]} "
+  [[ "$s" == *" --token 0189e772bfe63d815f026b8f76d292ea --target-ip 95.179.148.154 --mimics ssh --ssh-port 22 "* ]]
+  [[ "$s" != *" --persona "* ]]
+}
+
+@test "add-node args, ECH-free without an SSH mimic is refused" {
+  _iran_st "$TOK1" 'tls:443 https-alt:8443' yes
+  refute _hed_add_args
+  [[ "$HED_ADD_ERR" == *"no SSH mimic"* ]]
+}
+
+@test "probe ECH hint: TLS handshake timeouts while SSH works" {
+  local f="$BATS_TEST_TMPDIR/probe.txt"
+  cat >"$f" <<'EOF'
+
+Node "de1" (3 endpoints):
+  ✗ tls    95.179.148.154:443       FAIL: tls mimic handshake failed: tls handshake: read tcp 10.0.0.2:51234->95.179.148.154:443: i/o timeout
+  ✗ cpanel 95.179.148.154:2083      FAIL: cpanel mimic handshake failed: tls handshake: EOF
+  ✓ ssh    95.179.148.154:2200      OK  (88 ms)
+EOF
+  _hed_probe_ech_hint "$f"
+}
+
+@test "probe ECH hint: silent when all OK or when SSH fails too" {
+  local f="$BATS_TEST_TMPDIR/probe.txt"
+  cat >"$f" <<'EOF'
+  ✓ tls    95.179.148.154:443       OK  (90 ms)
+  ✓ ssh    95.179.148.154:2200      OK  (88 ms)
+EOF
+  refute _hed_probe_ech_hint "$f"
+  cat >"$f" <<'EOF'
+  ✗ tls    95.179.148.154:443       FAIL: tls mimic handshake failed: tls handshake: i/o timeout
+  ✗ ssh    95.179.148.154:2200      FAIL: dial tcp 95.179.148.154:2200: i/o timeout
+EOF
+  refute _hed_probe_ech_hint "$f"
+}
+
+@test "ECH status label" {
+  _iran_st "$TOK1" 'cpanel:2083 ssh:2200 tls:443' yes
+  [[ "$(_hed_ech_label)" == "off · SSH mimic only (:2200)" ]]
+  ST[noech]=no
+  [[ "$(_hed_ech_label)" == on* ]]
+}

@@ -134,6 +134,70 @@ _hed_token_decode() {
 _hed_eps_count() { local -a a=($1); printf '%s' "${#a[@]}"; }
 _hed_eps_pretty() { printf '%s' "$1" | sed 's/ /, /g'; }
 
+# _hed_eps_port <eps "type:port ..."> <mimic> -> that mimic's port (rc 1 if absent)
+_hed_eps_port() {
+  local e
+  for e in $1; do [[ "${e%%:*}" == "$2" ]] && { printf '%s' "${e#*:}"; return 0; }; done
+  return 1
+}
+
+# ---- ECH ---------------------------------------------------------------------
+# Every hedioum mimic except ssh dials through uTLS HelloChrome_Auto, whose ClientHello
+# carries a GREASE ECH extension (0xfe0d). Where DPI drops ECH ClientHellos those mimics
+# time out in the TLS handshake. ECH-free mode (ST[noech]=yes) makes the hub dial the
+# foreign's SSH mimic only, via hedioum's own add-node flags:
+#   --token <auth key> --target-ip <ip> --mimics ssh --ssh-port <port>
+# (a v2 token makes add-node ignore --mimics, so the bare auth key is passed instead).
+# ST[token] always keeps the full v2 token, so switching back restores every endpoint.
+
+# _hed_add_args : fills HED_ADD_ARGS (hedioum add-node argv) from ST.
+# rc 1 (reason in HED_ADD_ERR) when ECH-free mode is impossible.
+_hed_add_args() {
+  local rc p
+  HED_ADD_ARGS=(add-node --alias "$(_hed_alias)") HED_ADD_ERR=''
+  if [[ "${ST[noech]:-}" == yes ]]; then
+    p="$(_hed_eps_port "${ST[eps]:-}" ssh)" || { HED_ADD_ERR='the foreign has no SSH mimic — ECH-free mode needs one'; return 1; }
+    [[ -n "${ST[exit_ip]:-}" ]] || { HED_ADD_ERR='no foreign IP known for this node'; return 1; }
+    rc=0; _hed_token_decode "${ST[token]:-}" || rc=$?
+    (( rc == 0 || rc == 2 )) || { HED_ADD_ERR="invalid pairing token: $HT_ERR"; return 1; }
+    HED_ADD_ARGS+=(--token "$HT_AUTH" --target-ip "${ST[exit_ip]}" --mimics ssh --ssh-port "$p")
+  else
+    HED_ADD_ARGS+=(--token "${ST[token]}")
+    [[ "${ST[legacy]:-}" == yes ]] && HED_ADD_ARGS+=(--target-ip "${ST[exit_ip]}" --persona "${ST[persona]}")
+  fi
+  HED_ADD_ARGS+=(--socks-port "${ST[socks_port]}"
+                 --min "${ST[min]:-10}" --max "${ST[max]:-20}" --bw "${ST[bw]:-8}" --jitter "${ST[jitter]:-2}")
+  if [[ "${ST[tun]:-}" == yes ]]; then
+    HED_ADD_ARGS+=(--tun)
+    [[ -n "${ST[tun_name]:-}" ]] && HED_ADD_ARGS+=(--tun-name "${ST[tun_name]}")
+    [[ -n "${ST[tun_addr]:-}" ]] && HED_ADD_ARGS+=(--tun-addr "${ST[tun_addr]}")
+    [[ "${ST[dns]:-}" == yes ]] && HED_ADD_ARGS+=(--dns)
+    [[ "${ST[gateway]:-}" == yes ]] && HED_ADD_ARGS+=(--gateway)
+  fi
+  return 0
+}
+
+# _hed_probe_ech_hint <probe-output-file>
+# rc 0 when a TLS-based mimic failed in its handshake (timeout/reset/EOF) while the SSH
+# mimic worked — the signature of ECH/TLS ClientHello filtering.
+_hed_probe_ech_hint() {
+  local f="$1"
+  [[ -r "$f" ]] || return 1
+  sed -E $'s/\x1b\\[[0-9;]*m//g' "$f" | awk '
+    /✓[[:space:]]+ssh[[:space:]]/ { ssh_ok = 1 }
+    /✗[[:space:]]+/ && !/✗[[:space:]]+ssh[[:space:]]/ && /FAIL:/ && /handshake/ && /(timeout|reset|EOF)/ { tls_bad = 1 }
+    END { exit !(ssh_ok && tls_bad) }'
+}
+
+# one-line ECH status for this iran node
+_hed_ech_label() {
+  if [[ "${ST[noech]:-}" == yes ]]; then
+    printf 'off · SSH mimic only (:%s)' "$(_hed_eps_port "${ST[eps]:-}" ssh || echo '?')"
+  else
+    printf 'on · TLS mimics send Chrome GREASE ECH'
+  fi
+}
+
 # _hed_token_encode <ip> <auth> <persona> <sni> <eps "type:port ...">
 # byte-identical to Go json.Marshal(pairing.Token) + base64.RawURLEncoding
 _hed_token_encode() {
@@ -566,6 +630,21 @@ _hed_wizard_iran() {
     ui_ok "Persona \"$pname\" → $(_hed_eps_count "$eps") endpoints toward $ip"
   fi
 
+  # 1b) ECH: every mimic but ssh sends a Chrome ClientHello carrying the ECH extension
+  local sshp
+  if sshp="$(_hed_eps_port "${ST[eps]}" ssh)"; then
+    echo; ui_info "Which mimics should this hub dial?"
+    ui_note "hedioum's TLS mimics send a Chrome TLS ClientHello that includes the ECH extension."
+    ui_note "If they fail with TLS handshake timeouts (ECH blocked), use ECH-free: SSH mimic only."
+    ui_select "$([[ "${ST[noech]:-}" == yes ]] && echo 1 || echo 0)" \
+      $'All mimics\t'"$(_hed_eps_count "${ST[eps]}")"$' endpoints — TLS ones include ECH' \
+      $'ECH-free\tSSH mimic only (:'"$sshp"$') — no TLS, no ECH'
+    case "$SEL" in 1) ST[noech]=no ;; 2) ST[noech]=yes ;; *) return 1 ;; esac
+  else
+    ST[noech]=no
+    ui_warn "the foreign has no SSH mimic, so ECH-free mode is unavailable (add ssh to its mimics)."
+  fi
+
   # 2) node alias = tunnel name (must be unique on this hub)
   local editing=0 a
   [[ -n "${ST[socks_port]:-}" ]] && editing=1     # Edit of an existing node
@@ -625,6 +704,7 @@ t_hedioum_summary() {
   else
     ui_kv "Role" "Iran (hub)"
     ui_kv "Foreign" "${ST[exit_ip]} · ${ST[persona]:-custom} · $(_hed_eps_count "${ST[eps]}") endpoints"
+    ui_kv "ECH" "$(_hed_ech_label)"
     ui_kv "Node alias" "$(_hed_alias)"
     ui_kv "SOCKS5" "127.0.0.1:${ST[socks_port]}"
     ui_kv "Pool" "min ${ST[min]} · max ${ST[max]} · ${ST[bw]}±${ST[jitter]} Mbps"
@@ -742,18 +822,13 @@ _hed_add_node() {  # uses ST; upserts this node on the hub (add-node == setup-ir
   local b rc log
   b="$(_hed_bin)" || { ui_err "hedioum binary missing"; return 1; }
   log="$MILI_LOGDIR/hedioum-${ST[name]}.setup.log"; mkdir -p "$MILI_LOGDIR" 2>/dev/null || true
-  local -a a=(add-node --alias "$(_hed_alias)" --token "${ST[token]}" --socks-port "${ST[socks_port]}"
-              --min "${ST[min]:-10}" --max "${ST[max]:-20}" --bw "${ST[bw]:-8}" --jitter "${ST[jitter]:-2}")
-  [[ "${ST[legacy]:-}" == yes ]] && a+=(--target-ip "${ST[exit_ip]}" --persona "${ST[persona]}")
-  if [[ "${ST[tun]:-}" == yes ]]; then
-    a+=(--tun)
-    [[ -n "${ST[tun_name]:-}" ]] && a+=(--tun-name "${ST[tun_name]}")
-    [[ -n "${ST[tun_addr]:-}" ]] && a+=(--tun-addr "${ST[tun_addr]}")
-    [[ "${ST[dns]:-}" == yes ]] && a+=(--dns)
-    [[ "${ST[gateway]:-}" == yes ]] && a+=(--gateway)
+  _hed_add_args || { ui_err "$HED_ADD_ERR"; return 1; }
+  if [[ "${ST[noech]:-}" == yes ]]; then
+    ui_info "running: hedioum-tunnel add-node --alias $(_hed_alias) --socks-port ${ST[socks_port]} --token •••• --target-ip ${ST[exit_ip]} --mimics ssh --ssh-port $(_hed_eps_port "${ST[eps]}" ssh)  (ECH-free)"
+  else
+    ui_info "running: hedioum-tunnel add-node --alias $(_hed_alias) --socks-port ${ST[socks_port]} --token ••••"
   fi
-  ui_info "running: hedioum-tunnel add-node --alias $(_hed_alias) --socks-port ${ST[socks_port]} --token ••••"
-  run "$b" "${a[@]}" 2>&1 | tee -a "$log" | sed 's/^/    /'
+  run "$b" "${HED_ADD_ARGS[@]}" 2>&1 | tee -a "$log" | sed 's/^/    /'
   rc=${PIPESTATUS[0]}
   if (( rc != 0 )); then
     ui_err "hedioum add-node failed (exit $rc). Output: $log"
@@ -779,12 +854,23 @@ _hed_provision_iran() {
   fi
   ui_ok "SOCKS5 listening on 127.0.0.1:${ST[socks_port]}"
   echo; ui_info "probing every endpoint of the foreign:"
-  b="$(_hed_bin)"
-  run "$b" probe --node "$(_hed_alias)" 2>&1 | sed 's/^/    /'
-  if (( PIPESTATUS[0] != 0 )); then
-    ui_warn "some endpoints are unreachable (blocked port or foreign down) — the pool uses the rest."
-  fi
+  _hed_probe || ui_warn "some endpoints are unreachable (blocked port or foreign down) — the pool uses the rest."
   return 0
+}
+
+# hedioum probe for this node, indented; adds an ECH hint when the failures look like it
+_hed_probe() {
+  local b out rc
+  b="$(_hed_bin)" || return 1
+  out="$(mktemp)"
+  run "$b" probe --node "$(_hed_alias)" >"$out" 2>&1; rc=$?
+  sed 's/^/    /' "$out"
+  if [[ "${ST[noech]:-}" != yes ]] && _hed_probe_ech_hint "$out"; then
+    ui_note "TLS mimics fail in the TLS handshake while SSH works — likely ECH/TLS filtering."
+    ui_note "Fix: Edit this tunnel → 'ECH-free' (dial the SSH mimic only)."
+  fi
+  rm -f "$out"
+  return "$rc"
 }
 
 # ============================================================================
@@ -908,6 +994,7 @@ t_hedioum_info() {
   else
     ui_kv "role" "iran (hub) · node '$(_hed_alias)'"
     ui_kv "foreign" "${ST[exit_ip]:-?} · ${ST[persona]:-custom} · $(_hed_eps_count "${ST[eps]:-}") endpoints"
+    ui_kv "ECH" "$(_hed_ech_label)"
     ui_kv "pool" "min ${ST[min]:-10} · max ${ST[max]:-20} · ${ST[bw]:-8}±${ST[jitter]:-2} Mbps"
     [[ "${ST[tun]:-}" == yes ]] && ui_kv "TUN" "${ST[tun_name]:-auto} ${ST[tun_addr]:-auto}"
     echo; xui_outbound_box "127.0.0.1" "${ST[socks_port]:-?}" "" ""
@@ -928,7 +1015,7 @@ t_hedioum_test() {
   local b; b="$(_hed_bin 2>/dev/null)"
   if svc_active "$HED_UNIT"; then ui_ok "hedioum.service active"; else ui_err "hedioum.service not active"; fi
   if [[ "${ST[role]}" == iran ]]; then
-    [[ -n "$b" ]] && { run "$b" probe --node "$(_hed_alias)" 2>&1 | sed 's/^/    /' || true; }
+    [[ -n "$b" ]] && { _hed_probe || true; }
     doctor_socks 127.0.0.1 "${ST[socks_port]}" || true
   else
     local m p
@@ -953,9 +1040,15 @@ t_hedioum_handoff() {  # <name>
     echo; ui_info "Next, on the IRAN server:"
     ui_note "mili → New tunnel → Hedioum → Iran → paste this token."
     ui_note "(plain hedioum works too: hedioum-tunnel setup-iran --alias NAME --token <token> --socks-port N)"
+    if _hed_token_decode "$tok" && _hed_eps_port "$HT_EPS" ssh >/dev/null; then
+      ui_note "TLS mimics time out on Iran (ECH blocked)? Pick 'ECH-free' there: it dials the SSH mimic only."
+    else
+      ui_note "no SSH mimic here: Iran's ECH-free mode (SSH mimic only) needs ssh in this server's mimics."
+    fi
   else
     ui_head "Hedioum node '$(_hed_alias)' — Iran hub"
     ui_kv "foreign" "${ST[exit_ip]:-?} · ${ST[persona]:-custom} · $(_hed_eps_count "${ST[eps]:-}") endpoints"
+    ui_kv "ECH" "$(_hed_ech_label)"
     echo; xui_outbound_box "127.0.0.1" "${ST[socks_port]:-?}" "" ""
     ui_note "token in use (copy it to add this foreign to another hub):"
     printf '    %s%s%s\n' "${C_YEL:-}" "${ST[token]}" "${C_RST:-}"
