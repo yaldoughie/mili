@@ -106,14 +106,14 @@ mili_new_tunnel() {
   echo
 
   # ---- 1) tunnel type (arrow) ----
-  local -a order=(gre grefrp backhaul paqet hedioum frp "${MILI_TYPES[@]}")
+  local -a order=(gre grefrp backhaul paqet hedioum backpack frp "${MILI_TYPES[@]}")
   local -a types=() labels=(); local t seen='' title tier badge star
   for t in "${order[@]}"; do
     [[ " $seen " == *" $t "* ]] && continue
     declare -F "t_${t}_meta" >/dev/null 2>&1 || continue
     types+=("$t"); seen="$seen $t"
     title="$(t_meta_field "$t" title)"; tier="$(t_meta_field "$t" tier)"
-    star=''; case "$t" in gre|grefrp|backhaul|paqet|hedioum) star='★ ';; esac
+    star=''; case "$t" in gre|grefrp|backhaul|paqet|hedioum|backpack) star='★ ';; esac
     badge=''; [[ "$tier" == premium ]] && badge='premium'
     labels+=("$star$title"$'\t'"$badge")
   done

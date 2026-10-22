@@ -83,6 +83,7 @@ run `mili`. Core binaries move with `mili cores bundle` /
 | **Backhaul** | tcp/mux/ws/wss/udp (own values) | Iran | high-throughput muxed reverse tunnel |
 | **paqet** | raw pcap packets + KCP (own values) | Foreign | aggressive anti-DPI, TCP-flag cycling |
 | **Hedioum** | mimic pool SOCKS (native token) | Foreign egress | persona/mimic traffic shaping |
+| **BackPack** | 11 reverse transports: tcp, tcpmux, stealth, pck, udp, kcp, quic, ws, wsmux, wss, wssmux (native setup link) | Iran | many transports + presets; BackPack v1.8.5 |
 
 All tunnels coexist. Any tunnel may layer over another's inner IP (that is how
 GRE+FRP works, and e.g. Backhaul-over-GRE). Hedioum and paqet don't layer (they
@@ -160,6 +161,23 @@ side that **listens** first; it shows exactly what to use on the other server.
   token from a plain hedioum install works too. Start/Stop/Delete on Iran only
   touch that node; Delete on Foreign restores OpenSSH to its original port if
   hedioum moved it.
+- **BackPack** uses **its own `backpack://` setup link**. **Iran** first → *New
+  tunnel → BackPack → Iran*: mili asks BackPack's own Iran wizard questions in
+  BackPack's order (transport family/variant, Iran IP or domain, tunnel port,
+  IPv6, backup addresses, forwarded ports, token, carry UDP, TLS / simple auth
+  for WSS, flag pattern for PCK, PROXY protocol, preset, fine-tune, scheduled
+  restart). BackPack itself creates the tunnel (`backpack node exec`, the same
+  path its web panel uses: `/etc/backpack/<name>.toml`, `backpack-<name>.service`),
+  and mili prints the setup link (byte-identical to what BackPack prints).
+  **Foreign** → *New tunnel → BackPack → Foreign* (or paste the link into
+  *Import pairing code*) → mili runs `backpack link apply --name <name> '<link>'`.
+  SOCKS mode forwards Iran `127.0.0.1:<port>` (loopback only) to BackPack's
+  built-in SOCKS5 proxy on the kharej (`backpack proxy enable socks5 <port>`;
+  one proxy per server). mili installs BackPack v1.8.5 with BackPack's own steps
+  after checking the release's SHA-256; both servers must run the same version.
+  BackPack applies its own kernel tuning on every create
+  (`/etc/sysctl.d/zz-backpack.conf`); mili keeps its reserved ports merged with
+  BackPack's in `/etc/sysctl.d/zz-mili-ports.conf`, which loads after it.
 - **GRE / GRE+FRP** need *both* public IPs, so they use a two-step handshake:
   set up on **Iran** → code → paste on **Foreign** → Foreign prints a **reply
   code** → paste that back on Iran (*Import pairing code*). Link comes up. Still
@@ -175,6 +193,9 @@ tunnels send it:
 |---|---|---|
 | Hedioum: every mimic **except `ssh`** (tls, https-alt, cpanel, whm, webmail, directadmin, docker, grafana, prometheus, smtps, imaps, smtp, imap, postgres, mysql) | uTLS Chrome ClientHello, built into the hedioum binary | **yes** (GREASE ECH, no hedioum flag to turn it off) |
 | Hedioum `ssh` mimic | no TLS | no |
+| BackPack WSS / WSS Mux | uTLS Chrome ClientHello, built into the BackPack binary | **yes** (GREASE ECH) — pick TCP + Stealth or WS where ECH is blocked |
+| BackPack QUIC | quic-go (Go standard TLS) | no |
+| BackPack tcp, tcpmux, stealth (Noise), pck, udp, kcp, ws, wsmux | no TLS | no |
 | Backhaul wss / wssmux | Go standard `crypto/tls` | no |
 | FRP / GRE+FRP with TLS | Go standard `crypto/tls` | no |
 | Backhaul tcp/tcpmux/ws/udp, paqet, GRE | no TLS | no |

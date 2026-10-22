@@ -19,6 +19,7 @@ cores_version() {
     backhaul) echo "0.7.2" ;;
     paqet)    echo "1.0.0-alpha.21" ;;
     hedioum)  echo "0.11.0" ;;
+    backpack) echo "1.8.5" ;;
     gost)     echo "3.3.0" ;;
     rathole)  echo "0.5.0" ;;
     hysteria) echo "2.13.0" ;;
@@ -59,11 +60,23 @@ cores_url() {  # <core>
                 armv7) echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel-armv7" ;;
                 *) echo "https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/download/v$v/hedioum-tunnel" ;;
               esac ;;
+    backpack) echo "https://github.com/AminMGMT/BackPack/releases/download/v$v/backpack_linux_${a}.tar.gz" ;;
     rathole)  echo "https://github.com/rapiz1/rathole/releases/download/v$v/rathole-${a}-unknown-linux-musl.zip" ;;
     hysteria) echo "https://github.com/apernet/hysteria/releases/download/app/v$v/hysteria-linux-${a}" ;;
     singbox)  echo "https://github.com/SagerNet/sing-box/releases/download/v$v/sing-box-${v}-linux-${a}.tar.gz" ;;
     *) return 1 ;;
   esac
+}
+
+# pinned sha256 of the release asset (verified before install; mismatch = refuse).
+# backpack: from the v1.8.5 release's own SHA256SUMS - BackPack never installs unverified.
+cores_sha256() {  # <core> -> digest for $MILI_ARCH, or nothing when not pinned
+  case "$1/$MILI_ARCH" in
+    backpack/amd64) echo e80c4da9bdcece9e7a82305e572fdfde9a395a68a985fdd835c1af8ff248b395 ;;
+    backpack/arm64) echo 9d9eaa951f8bd3f7b786be94916517c4ec900af0eeaac893b89d03d9867643f4 ;;
+    backpack/armv7) echo add4de9951d0ec2d4dfd92f8837f84c9c70f8607b106231b9c54eb9632c4504c ;;
+  esac
+  return 0
 }
 
 # binaries produced by a core and their final symlink names
@@ -74,6 +87,7 @@ cores_binaries() {  # <core>
     gost)     echo "gost" ;;
     paqet)    echo "paqet" ;;
     hedioum)  echo "hedioum-tunnel" ;;
+    backpack) echo "backpack" ;;
     rathole)  echo "rathole" ;;
     hysteria) echo "hysteria" ;;
     singbox)  echo "sing-box" ;;
@@ -107,6 +121,16 @@ cores_install() {  # <core>
   tmp="$(mktemp -d)"; f="$tmp/dl_$(basename "$url")"
 
   fetch_url "$url" "$f" || { rm -rf "$tmp"; return 1; }
+  local want got
+  want="$(cores_sha256 "$core")"
+  if [[ -n "$want" ]]; then
+    got="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+    if [[ "$got" != "$want" ]]; then
+      ui_err "CHECKSUM MISMATCH for $(basename "$url") (expected ${want:0:16}..., got ${got:0:16}...) - refusing to install"
+      rm -rf "$tmp"; return 1
+    fi
+    ui_ok "checksum verified: ${got:0:16}..."
+  fi
 
   case "$f" in
     *.tar.gz|*.tgz) tar -xzf "$f" -C "$tmp" 2>/dev/null || { ui_err "extract failed"; rm -rf "$tmp"; return 1; } ;;

@@ -153,6 +153,8 @@ ports_sync_reserved() {
   [[ -f "$MILI_PORTSDB" ]] || return 0
   local list
   list=$(awk -F'|' '$4!="127.0.0.1" && $3 ~ /^[0-9]+$/ {print $3}' "$MILI_PORTSDB" | sort -un | paste -sd, -)
+  # keep BackPack's reservations too: one kernel list, the last sysctl file wins
+  list="$(sysctl_ports_union "$list" "$(sysctl_backpack_reserved)")"
   sysctl_set_reserved_ports "$list"
 }
 

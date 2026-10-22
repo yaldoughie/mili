@@ -63,6 +63,21 @@ list twice: (A) install mili first then 3x-ui, (B) 3x-ui first then mili.
 - [ ] Stop the foreign paqet → Iran watchdog probe fails → unit restarted after
       3 checks (see `/var/log/mili/watchdog.log`).
 
+## BackPack (native setup link, v1.8.5)
+- [ ] `mili cores install backpack` → "checksum verified"; `/usr/local/bin/backpack -v` = v1.8.5;
+      `/etc/backpack/install_path` = `/root/BackPack`.
+- [ ] Iran: New tunnel → BackPack → Iran, TCP, Enter through, SOCKS → `/etc/backpack/<name>.toml`,
+      `backpack-<name>.service` active, listening on the tunnel port; setup link printed.
+- [ ] `sudo backpack` → Manage → the tunnel → Setup Link prints the **same** link as mili.
+- [ ] Foreign: paste the link → `backpack link apply` reports Connected;
+      `backpack proxy status` = socks5 on 127.0.0.1:10800; Iran Test → SOCKS works, exit IP = foreign.
+- [ ] WSS + Let's Encrypt: `acme_domain` line right after `tls_key`; port forward 443 works.
+- [ ] KCP + Throughput, PCK + flags PA,A, restart every 6h → `backpack-restart-<name>.timer` on both.
+- [ ] `cat /proc/sys/net/ipv4/ip_local_reserved_ports` holds both mili's and BackPack's ports,
+      also after a reboot (`zz-mili-ports.conf` loads after `zz-backpack.conf`).
+- [ ] Edit Iran (change transport) → new link; paste on foreign → updated in place, reconnects.
+- [ ] Delete on both → `backpack tunnel list` empty, no `backpack-<name>*` units, proxy disabled.
+
 ## Coexistence
 - [ ] All six tunnels **up simultaneously**; `mili ports` reports no conflict.
 - [ ] x-ui panel reachable, inbounds работают, ACME renew on port 80 still works.
